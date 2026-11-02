@@ -100,6 +100,8 @@ export interface AndroidCheck {
   serial: string;
   model: string | null;
   root: string;
+  products: string[];
+  business: boolean;
   has_crypt15: boolean;
   media_bytes: number | null;
 }

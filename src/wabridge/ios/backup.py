@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import hashlib
 import os
+import pathlib
 import plistlib
+import re
 import shutil
 import sqlite3
 import time
@@ -57,7 +59,7 @@ class ManifestEntry:
 
 
 class Backup:
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, read_only: bool = False):
         self.path = os.path.abspath(path)
         self.manifest_db = os.path.join(self.path, "Manifest.db")
         self.manifest_plist = os.path.join(self.path, "Manifest.plist")
@@ -69,7 +71,10 @@ class Backup:
                 "This backup is encrypted. Turn off 'Encrypt local backup' (or run "
                 "`wabridge ios disable-encryption`) and back up again."
             )
-        self.conn = sqlite3.connect(self.manifest_db)
+        # `immutable` because Manifest.db is in WAL mode, where even a `mode=ro` open wants to write -shm.
+        self.read_only = read_only
+        self.conn = sqlite3.connect(f"{pathlib.Path(self.manifest_db).as_uri()}?immutable=1", uri=True) if read_only \
+            else sqlite3.connect(self.manifest_db)
         self.conn.row_factory = sqlite3.Row
         self._next_inode = self._max_inode() + 1
 
@@ -82,7 +87,8 @@ class Backup:
             return plistlib.load(fh)
 
     def close(self) -> None:
-        self.conn.commit()
+        if not self.read_only:
+            self.conn.commit()
         self.conn.close()
 
     def __enter__(self) -> Backup:
@@ -119,6 +125,13 @@ class Backup:
     def has_whatsapp(self, domain: str = WA_GROUP_DOMAIN) -> bool:
         return self.get(domain, CHATSTORAGE) is not None
 
+    def missing_regular_chats(self) -> bool:
+        """Regular WhatsApp is installed but its main chat database isn't in this backup. WhatsApp can leave it
+        out while the chats are fine on the phone (seen with two accounts in one app), so a whole-phone restore
+        of such a backup could lose them. Unverified what iOS does in that case."""
+        apps = self._load_plist(os.path.join(self.path, "Info.plist")).get("Installed Applications", [])
+        return "net.whatsapp.WhatsApp" in apps and not self.has_whatsapp(WA_GROUP_DOMAIN)
+
     def extract(self, domain: str, relative_path: str, dest: str) -> str:
         entry = self.get(domain, relative_path)
         if not entry or entry.flags != FLAG_FILE:
@@ -138,6 +151,19 @@ class Backup:
             if self.get(domain, CHATSTORAGE + suffix):
                 self.extract(domain, CHATSTORAGE + suffix, os.path.join(dest_dir, CHATSTORAGE + suffix))
         return out
+
+    def owner_jid(self, domain: str) -> str | None:
+        """The account's own JID, from WhatsApp's settings file in the backup."""
+        group = domain.split("AppDomainGroup-", 1)[-1]
+        entry = self.get(domain, f"Library/Preferences/{group}.plist")
+        if not entry or not os.path.isfile(self.blob_path(entry.file_id)):
+            return None
+        try:
+            prefs = self._load_plist(self.blob_path(entry.file_id))
+        except Exception:  # noqa: BLE001 — unknown format: replies then simply name no sender
+            return None
+        jid = prefs.get("LastOwnJabberID")
+        return jid if isinstance(jid, str) and re.fullmatch(r"\d+@s\.whatsapp\.net", jid) else None
 
     # ------------------------------------------------------------------ MBFile blobs
     def _max_inode(self) -> int:
@@ -170,7 +196,7 @@ class Backup:
         if template:
             try:
                 return _rewrite_mbfile(template, relative_path, size, MODE_DIR if is_dir else MODE_FILE,
-                                       mtime, inode, digest)
+                                       mtime, inode, digest, drop_xattrs=True)
             except Exception:
                 pass
         return build_mbfile(relative_path, size, MODE_DIR if is_dir else MODE_FILE, mtime, inode,
@@ -255,10 +281,12 @@ def _mbfile_dict(plist: dict) -> dict:
 
 
 def _rewrite_mbfile(blob: bytes, relative_path: str, size: int, mode: int, mtime: int,
-                    inode: int | None, digest: bytes | None) -> bytes:
+                    inode: int | None, digest: bytes | None, *, drop_xattrs: bool = False) -> bytes:
     plist = plistlib.loads(blob)
     objs = plist["$objects"]
     d = _mbfile_dict(plist)
+    if drop_xattrs:
+        d.pop("ExtendedAttributes", None)    # `com.whatsapp.original` names the template's own file
     d["Size"] = size
     d["Mode"] = mode
     d["LastModified"] = mtime

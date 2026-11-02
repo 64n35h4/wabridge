@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
+import shutil
 import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 sys.path.insert(0, os.path.dirname(__file__))
@@ -15,10 +18,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 import fixtures  # noqa: E402
 
 from wabridge import pipeline  # noqa: E402
-from wabridge.android import crypt15, msgstore  # noqa: E402
+from wabridge.android import adb, crypt15, msgstore  # noqa: E402
 from wabridge.ios import backup as iosbackup  # noqa: E402
-from wabridge.ios import chatstorage  # noqa: E402
-from wabridge.model import MsgKind  # noqa: E402
+from wabridge.ios import chatstorage, probe  # noqa: E402
+from wabridge.model import Message, MsgKind  # noqa: E402
 
 KEY = "0123456789abcdef" * 4
 
@@ -147,6 +150,9 @@ class ChatStorageWriterTests(unittest.TestCase):
         self.assertEqual(rep.media_missing, 1)            # VID-001.mp4 not pulled
         self.assertEqual(len(rep.media_jobs), 4)
         self.assertTrue(all(j.relative_path.startswith("Message/Media/") for j in rep.media_jobs))
+        self.assertEqual(rep.replies, 2)
+        self.assertEqual(rep.replies_without_sender, 1)   # the fixture archive has no owner JID
+        self.assertEqual(rep.reactions, 2)
 
         conn = sqlite3.connect(self.cs)
         conn.row_factory = sqlite3.Row
@@ -170,10 +176,13 @@ class ChatStorageWriterTests(unittest.TestCase):
         # incoming group message links to a member row with resolved LID
         bob_msg = conn.execute("SELECT * FROM ZWAMESSAGE WHERE ZSTANZAID='K111'").fetchone()
         member = conn.execute("SELECT * FROM ZWAGROUPMEMBER WHERE Z_PK=?", (bob_msg["ZGROUPMEMBER"],)).fetchone()
-        self.assertEqual(member["ZMEMBERJID"], fixtures.BOB_PN)
+        self.assertEqual(member["ZMEMBERJID"], fixtures.BOB_LID)       # WhatsApp's active members are LIDs
+        self.assertEqual(member["ZISACTIVE"], 1)
         self.assertEqual(member["ZCONTACTNAME"], "Bob")
+        alice_member = conn.execute("SELECT * FROM ZWAGROUPMEMBER WHERE ZMEMBERJID=?", (fixtures.ALICE,)).fetchone()
+        self.assertEqual(alice_member["ZISACTIVE"], 0)                 # no LID known: a phone row is never active
         self.assertEqual(bob_msg["ZFROMJID"], fixtures.GROUP)
-        self.assertEqual(bob_msg["ZPUSHNAME"], "Bob")
+        self.assertIsNone(bob_msg["ZPUSHNAME"])     # no real row proves plain text is safe here
         # outgoing message conventions
         mine = conn.execute("SELECT * FROM ZWAMESSAGE WHERE ZSTANZAID='K112'").fetchone()
         self.assertEqual(mine["ZISFROMME"], 1)
@@ -187,16 +196,21 @@ class ChatStorageWriterTests(unittest.TestCase):
         mi = conn.execute("SELECT * FROM ZWAMEDIAITEM WHERE Z_PK=?", (img["ZMEDIAITEM"],)).fetchone()
         self.assertEqual(mi["ZMESSAGE"], img["Z_PK"])
         self.assertEqual(mi["ZTITLE"], "look at this")
-        self.assertIsNone(mi["ZVCARDSTRING"])          # MIME must NOT go in the vCard column
+        self.assertEqual(mi["ZVCARDSTRING"], "image/jpeg")
+        self.assertEqual(img["ZFLAGS"], chatstorage.FLAGS_FILE)
         self.assertEqual(img["ZMEDIASECTIONID"], "2024-09")
-        self.assertTrue(mi["ZMEDIALOCALPATH"].endswith("-IMG-001.jpg"))
-        self.assertTrue(mi["ZMEDIALOCALPATH"].startswith(f"Message/Media/{fixtures.ALICE}/"))
-        voice = conn.execute("SELECT ZMESSAGETYPE FROM ZWAMESSAGE WHERE ZSTANZAID='K103'").fetchone()[0]
-        self.assertEqual(voice, 3)
-        doc = conn.execute(
-            "SELECT m.ZTITLE FROM ZWAMEDIAITEM m JOIN ZWAMESSAGE g ON g.ZMEDIAITEM=m.Z_PK WHERE g.ZSTANZAID='K109'"
-        ).fetchone()[0]
-        self.assertEqual(doc, "report.pdf")
+        self.assertEqual(mi["ZVCARDNAME"], fixtures.sha256_b64(fixtures.IMAGE_BYTES))
+        # relative to Message/: the row and the backup path differ by exactly that prefix
+        self.assertRegex(mi["ZMEDIALOCALPATH"], rf"^Media/{fixtures.ALICE}/(.)/(.)/\1\2[-0-9a-f]+\.jpg$")
+        self.assertIn("Message/" + mi["ZMEDIALOCALPATH"], [j.relative_path for j in rep.media_jobs])
+        text = conn.execute("SELECT ZFLAGS FROM ZWAMESSAGE WHERE ZSTANZAID='K100'").fetchone()[0]
+        self.assertEqual(text, chatstorage.FLAGS_TEXT)
+        voice = conn.execute("SELECT m.ZMESSAGETYPE, i.ZMEDIAORIGIN FROM ZWAMESSAGE m JOIN ZWAMEDIAITEM i "
+                             "ON m.ZMEDIAITEM=i.Z_PK WHERE m.ZSTANZAID='K103'").fetchone()
+        self.assertEqual(tuple(voice), (3, chatstorage.ORIGIN_VOICE))
+        doc = conn.execute("SELECT g.ZTEXT, m.ZAUTHORNAME, m.ZVCARDSTRING FROM ZWAMEDIAITEM m "
+                           "JOIN ZWAMESSAGE g ON g.ZMEDIAITEM=m.Z_PK WHERE g.ZSTANZAID='K109'").fetchone()
+        self.assertEqual(tuple(doc), ("report.pdf", "report.pdf", "application/pdf"))
         loc = conn.execute(
             "SELECT m.ZLATITUDE FROM ZWAMEDIAITEM m JOIN ZWAMESSAGE g ON g.ZMEDIAITEM=m.Z_PK WHERE g.ZSTANZAID='K104'"
         ).fetchone()[0]
@@ -232,9 +246,233 @@ class ChatStorageWriterTests(unittest.TestCase):
 
     def test_media_filenames_do_not_collide(self):
         self.assertNotEqual(
-            chatstorage.media_relative_path("x@g.us", "a1-IMG.jpg"),
-            chatstorage.media_relative_path("x@g.us", "b2-IMG.jpg"),
+            chatstorage.media_db_path("x@g.us", "K1", ".jpg"),
+            chatstorage.media_db_path("x@g.us", "K2", ".jpg"),
         )
+
+    def _row(self, conn, key):
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT m.*, i.ZMETADATA, i.ZTITLE, i.ZMEDIALOCALPATH, i.ZVCARDSTRING, i.ZFILESIZE "
+                            "FROM ZWAMESSAGE m LEFT JOIN ZWAMEDIAITEM i ON m.ZMEDIAITEM=i.Z_PK "
+                            "WHERE m.ZSTANZAID=?", (key,)).fetchone()
+
+    def test_missing_file_still_gets_a_bubble(self):
+        w = chatstorage.Writer(self.cs)
+        w.import_archive(self.archive, media_root=self.media)
+        w.finalize()
+        conn = sqlite3.connect(self.cs)
+        row = self._row(conn, "K112")               # VID-001.mp4 isn't on the phone
+        self.assertEqual(row["ZMESSAGETYPE"], 2)
+        self.assertIsNotNone(row["ZMEDIAITEM"])
+        self.assertIsNone(row["ZMEDIALOCALPATH"])
+        self.assertEqual(row["ZVCARDSTRING"], "video/mp4")
+        self.assertEqual(row["ZFILESIZE"], 55555)
+        self.assertEqual(row["ZFLAGS"], chatstorage.FLAGS_FILE)
+        conn.close()
+
+    def test_rows_follow_what_whatsapp_writes(self):
+        w = chatstorage.Writer(self.cs)
+        w.import_archive(self.archive, media_root=self.media)
+        w.finalize()
+        conn = sqlite3.connect(self.cs)
+        conn.row_factory = sqlite3.Row
+        text = self._row(conn, "K100")
+        self.assertEqual(text["ZGROUPEVENTTYPE"], chatstorage.EVENT_NONE)
+        self.assertIsNone(text["ZSTARRED"])
+        self.assertIsNone(text["ZSENTDATE"])
+        self.assertIsNone(self._row(conn, "K112")["ZMEDIASECTIONID"])     # no file, so not in the gallery
+        self.assertIsNone(self._row(conn, "K108")["ZMEDIASECTIONID"])     # stickers never are
+        self.assertIsNone(self._row(conn, "K103")["ZMEDIASECTIONID"])     # nor voice notes
+        contact = self._row(conn, "K105")
+        self.assertIsNone(contact["ZTEXT"])
+        self.assertEqual(contact["ZMESSAGETYPE"], 4)
+        for session in conn.execute("SELECT Z_PK, ZLASTMESSAGE FROM ZWACHATSESSION").fetchall():
+            marked = conn.execute("SELECT Z_PK FROM ZWAMESSAGE WHERE ZLASTSESSION=?", (session["Z_PK"],)).fetchall()
+            self.assertEqual([r[0] for r in marked], [session["ZLASTMESSAGE"]])
+        conn.close()
+
+    def test_a_few_rows_are_not_a_convention(self):
+        conn = sqlite3.connect(self.cs)
+        conn.execute("UPDATE ZWAMESSAGE SET ZMESSAGESTATUS=1, ZFLAGS=7, ZGROUPEVENTTYPE=9")     # a single pending row
+        conn.commit()
+        conn.close()
+        w = chatstorage.Writer(self.cs)
+        self.assertEqual(w.conv["msg_status_out"], 8)
+        self.assertEqual(w.conv["msg_flags_out"], chatstorage.FLAGS_TEXT)
+        self.assertEqual(w.conv["msg_group_event"], chatstorage.EVENT_NONE)
+        w.conn.close()
+
+    def test_chat_with_only_group_events_creates_no_session(self):
+        archive = msgstore.parse(self.msg)
+        archive.chats[0].messages = [Message(key_id="S1", from_me=False, timestamp_ms=1, kind=MsgKind.SYSTEM)]
+        archive.chats[0].jid = "6100000@s.whatsapp.net"
+        w = chatstorage.Writer(self.cs)
+        rep = w.import_archive(archive, media_root=self.media)
+        w.finalize()
+        self.assertEqual(rep.system_skipped, 1)
+        conn = sqlite3.connect(self.cs)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM ZWACHATSESSION WHERE ZCONTACTJID LIKE '6100000%'")
+                         .fetchone()[0], 0)
+        conn.close()
+
+    def test_reply_metadata(self):
+        self.archive.owner_jid = fixtures.ME
+        w = chatstorage.Writer(self.cs)
+        rep = w.import_archive(self.archive, media_root=self.media)
+        w.finalize()
+        self.assertEqual(rep.replies_without_sender, 0)
+        conn = sqlite3.connect(self.cs)
+        text_reply = self._row(conn, "K111")
+        self.assertEqual(text_reply["ZMESSAGETYPE"], 0)
+        self.assertEqual(text_reply["ZTEXT"], "group msg from bob (lid)")
+        fields = probe.pb_fields(text_reply["ZMETADATA"])
+        self.assertEqual([f[0] for f in fields], [5, 6, 19, 211])
+        self.assertEqual(fields[0][2], b"K110")
+        self.assertEqual(fields[1][2], fixtures.ALICE.encode())
+        self.assertEqual(probe.pb_fields(fields[2][2]), [(1, 2, b"group msg from alice")])
+        self.assertEqual(fields[3][2], 0)
+        own_quote = probe.pb_fields(self._row(conn, "K112")["ZMETADATA"])     # a reply on a media message
+        self.assertEqual(own_quote[1][2], fixtures.ME.encode())
+        self.assertEqual(probe.pb_fields(own_quote[2][2]), [(1, 2, b"Photo")])
+        conn.close()
+
+    def test_reactions(self):
+        w = chatstorage.Writer(self.cs)
+        w.import_archive(self.archive, media_root=self.media)
+        w.finalize()
+        conn = sqlite3.connect(self.cs)
+        row = self._row(conn, "K100")
+        blob = conn.execute("SELECT ZRECEIPTINFO FROM ZWAMESSAGEINFO WHERE Z_PK=? AND ZMESSAGE=?",
+                            (row["ZMESSAGEINFO"], row["Z_PK"])).fetchone()[0]
+        (number, _wire, value), = probe.pb_fields(blob)
+        self.assertEqual(number, 7)
+        items = [dict((f[0], f[2]) for f in probe.pb_fields(i[2])) for i in probe.pb_fields(value)]
+        self.assertEqual(items[0][1], b"R1")
+        self.assertEqual(items[0][2], fixtures.ALICE.encode())
+        self.assertEqual(items[0][3].decode(), "❤️")
+        self.assertEqual(items[0][4], 1_726_000_001_500)
+        self.assertNotIn(6, items[0])
+        self.assertNotIn(2, items[1])              # my own reaction names no sender, it sets field 6
+        self.assertEqual(items[1][6], 1)
+        self.assertIsNone(self._row(conn, "K102")["ZMESSAGEINFO"])   # a reaction taken back leaves nothing
+        pk = conn.execute("SELECT Z_MAX FROM Z_PRIMARYKEY WHERE Z_NAME='WAMessageInfo'").fetchone()[0]
+        self.assertEqual(pk, 1)
+        conn.close()
+
+    def test_group_already_synced_at_login(self):
+        # WhatsApp lists the group's members by LID as soon as the account logs in.
+        conn = sqlite3.connect(self.cs)
+        conn.execute("INSERT INTO ZWACHATSESSION (Z_PK, Z_ENT, Z_OPT, ZCONTACTJID, ZSESSIONTYPE) VALUES (9, 2, 1, ?, 1)",
+                     (fixtures.GROUP,))
+        conn.execute("INSERT INTO ZWAGROUPMEMBER (Z_PK, Z_ENT, Z_OPT, ZCHATSESSION, ZMEMBERJID, ZISACTIVE, ZISADMIN) "
+                     "VALUES (5, ?, 1, 9, ?, 1, 0)", (5, fixtures.BOB_LID))
+        conn.commit()
+        conn.close()
+        w = chatstorage.Writer(self.cs)
+        w.import_archive(self.archive, media_root=self.media)
+        w.finalize()
+        conn = sqlite3.connect(self.cs)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT Z_PK, ZMEMBERJID FROM ZWAGROUPMEMBER WHERE ZCHATSESSION=9").fetchall()
+        jids = [r["ZMEMBERJID"] for r in rows]
+        self.assertEqual(jids.count(fixtures.BOB_LID), 1)
+        self.assertNotIn(fixtures.BOB_PN, jids)
+        self.assertEqual(self._row(conn, "K111")["ZGROUPMEMBER"], 5)
+        conn.close()
+
+    def test_account_placeholder_is_not_a_group_member(self):
+        conn = sqlite3.connect(self.msg)
+        conn.execute("INSERT INTO jid VALUES (90, 'lid_me', 'lid_me', 0, 0, 11, 'lid_me')")
+        conn.execute("INSERT INTO group_participant_user VALUES (90, 5, 90, 2, 0)")
+        conn.commit()
+        conn.close()
+        group = next(c for c in msgstore.parse(self.msg).chats if c.is_group)
+        self.assertTrue(all("@" in p.jid for p in group.participants))
+
+    def test_lid_session_uses_its_lid_everywhere(self):
+        lid = "99887766@lid"
+        conn = sqlite3.connect(self.cs)
+        conn.execute("UPDATE ZWACHATSESSION SET ZCONTACTJID=?, ZCONTACTIDENTIFIER=? WHERE ZCONTACTJID=?",
+                     (lid, fixtures.ALICE, fixtures.ALICE))
+        conn.commit()
+        conn.close()
+        archive = msgstore.parse(self.msg, contacts=self.archive.contacts, include_revoked=True)
+        archive.phone_to_lid[fixtures.ALICE] = lid
+        w = chatstorage.Writer(self.cs)
+        w.import_archive(archive, media_root=self.media)
+        w.finalize()
+        conn = sqlite3.connect(self.cs)
+        conn.row_factory = sqlite3.Row
+        row = self._row(conn, "K100")
+        self.assertEqual(row["ZFROMJID"], lid)
+        self.assertEqual(self._row(conn, "K103")["ZTOJID"], lid)
+        revoked = conn.execute("SELECT i.ZVCARDNAME FROM ZWAMEDIAITEM i JOIN ZWAMESSAGE m ON m.ZMEDIAITEM=i.Z_PK "
+                               "WHERE m.ZSTANZAID='K107'").fetchone()
+        self.assertEqual(revoked[0], lid)                               # a deleted message names its chat
+        blob = conn.execute("SELECT ZRECEIPTINFO FROM ZWAMESSAGEINFO WHERE Z_PK=?", (row["ZMESSAGEINFO"],)).fetchone()[0]
+        reaction = dict((f[0], f[2]) for f in probe.pb_fields(probe.pb_fields(probe.pb_fields(blob)[0][2])[0][2]))
+        self.assertEqual(reaction[2], lid.encode())
+        conn.close()
+
+    def test_revoked_message(self):
+        archive = msgstore.parse(self.msg, include_revoked=True)
+        w = chatstorage.Writer(self.cs)
+        rep = w.import_archive(archive, media_root=self.media)
+        w.finalize()
+        self.assertEqual(rep.revoked, 1)
+        conn = sqlite3.connect(self.cs)
+        row = self._row(conn, "K107")
+        self.assertEqual(row["ZMESSAGETYPE"], 14)
+        self.assertIsNone(row["ZTEXT"])
+        self.assertEqual(row["ZTITLE"], "ORIG107")
+        self.assertIsNone(row["ZMETADATA"])
+        conn.close()
+
+    def test_group_events_are_not_written(self):
+        archive = msgstore.parse(self.msg, include_system=True)
+        w = chatstorage.Writer(self.cs)
+        rep = w.import_archive(archive, media_root=self.media)
+        w.finalize()
+        self.assertEqual(rep.system_skipped, 1)
+        conn = sqlite3.connect(self.cs)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM ZWAMESSAGE WHERE ZSTANZAID='K106'").fetchone()[0], 0)
+        conn.close()
+
+    def test_file_found_by_content_hash_wherever_it_is(self):
+        # The database still says WhatsApp Images; the file is in the Business folder under another name.
+        moved = os.path.join(self.media, "WhatsApp Business Images")
+        os.makedirs(moved)
+        shutil.move(os.path.join(self.media, "WhatsApp Images", "IMG-001.jpg"), os.path.join(moved, "other.jpg"))
+        chatstorage._media_hash_index.cache_clear()
+        w = chatstorage.Writer(self.cs)
+        rep = w.import_archive(self.archive, media_root=self.media)
+        w.finalize()
+        self.assertTrue(any(j.local_file.endswith("other.jpg") for j in rep.media_jobs))
+
+    def test_same_file_name_with_another_hash_is_not_linked(self):
+        other = os.path.join(self.media, "WhatsApp Images", "Sent")
+        os.makedirs(other)
+        shutil.move(os.path.join(self.media, "WhatsApp Images", "IMG-001.jpg"), os.path.join(other, "IMG-001.jpg"))
+        with open(os.path.join(other, "IMG-001.jpg"), "wb") as fh:
+            fh.write(b"somebody else's photo")
+        chatstorage._media_hash_index.cache_clear()
+        chatstorage._media_index.cache_clear()
+        w = chatstorage.Writer(self.cs)
+        rep = w.import_archive(self.archive, media_root=self.media)
+        w.finalize()
+        self.assertEqual(rep.media_linked, 3)
+        self.assertEqual(rep.media_missing, 2)
+        conn = sqlite3.connect(self.cs)
+        self.assertIsNone(self._row(conn, "K102")["ZMEDIALOCALPATH"])
+        self.assertIsNotNone(self._row(conn, "K102")["ZMEDIAITEM"])
+        conn.close()
+
+    def test_unproven_columns_stay_empty_when_no_row_shows_them(self):
+        w = chatstorage.Writer(self.cs)
+        self.assertTrue(w.conv["lasttext_is_blob"])
+        self.assertTrue(w.conv["pushname_is_blob"])
+        w.conn.close()
+
 
     def test_import_is_idempotent(self):
         w = chatstorage.Writer(self.cs)
@@ -246,6 +484,24 @@ class ChatStorageWriterTests(unittest.TestCase):
         self.assertEqual(rep2.messages_written, 0)
         self.assertEqual(rep2.sessions_created, 0)
 
+
+class AdbMediaFolderTests(unittest.TestCase):
+    def test_business_and_regular_names(self):
+        listing = "\n".join([" AI Media", ".Links", "WallPaper", "WhatsApp Business Images",
+                             "WhatsApp Business Stickers", "WhatsApp Images"])
+        with mock.patch.object(adb, "shell", return_value=listing):
+            self.assertEqual(adb.media_dirs("/root"),
+                             ["WhatsApp Images", "WhatsApp Business Images", "WhatsApp Business Stickers"])
+
+    def test_detect_products(self):
+        def shell(cmd, serial=None, check=True):
+            return "msgstore.db.crypt15" if "w4b" in cmd else ""
+
+        with mock.patch.object(adb, "shell", shell):
+            self.assertEqual(list(adb.detect_products()), ["business"])
+            self.assertIn("w4b", adb.detect_wa_root(business=True))
+            with self.assertRaisesRegex(adb.AdbError, "WhatsApp's Databases"):
+                adb.detect_wa_root()
 
 class BackupTests(unittest.TestCase):
     def setUp(self):
@@ -346,7 +602,7 @@ class PipelineOfflineTests(unittest.TestCase):
             with open(work.path("android", "contacts.json"), "w") as fh:
                 json.dump({"61400000002": "Alice"}, fh)
             cs = os.path.join(d, "ChatStorage.sqlite")
-            fixtures.make_chatstorage(cs, with_existing_alice=False)
+            fixtures.make_chatstorage(cs)
             folder = fixtures.make_ios_backup(os.path.join(work.backup_root, "UDID1"), cs)
 
             # also exercise the decrypt stage with our own encoder
@@ -360,8 +616,9 @@ class PipelineOfflineTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(work.msgstore_db))
 
             rep = pipeline.convert(work, backup_folder=folder, out=logs.append)
-            self.assertEqual(rep.messages_written, 11)
-            self.assertEqual(rep.sessions_created, 2)
+            self.assertEqual(rep.messages_written, 11)       # 10 + the deleted-message marker
+            self.assertEqual(rep.revoked, 1)
+            self.assertEqual(rep.sessions_created, 1)
             pipeline.inject(work, backup_folder=folder, out=logs.append)
 
             with iosbackup.Backup(folder) as b:
@@ -374,7 +631,7 @@ class PipelineOfflineTests(unittest.TestCase):
                 # the injected ChatStorage is the converted one
                 cs_entry = b.get(iosbackup.WA_GROUP_DOMAIN, iosbackup.CHATSTORAGE)
                 conn = sqlite3.connect(b.blob_path(cs_entry.file_id))
-                self.assertEqual(conn.execute("SELECT COUNT(*) FROM ZWAMESSAGE").fetchone()[0], 11)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM ZWAMESSAGE").fetchone()[0], 12)
                 conn.close()
             self.assertIn("inject", work.state)
             self.assertTrue(any("media: 4 linked" in line for line in logs))
@@ -383,6 +640,155 @@ class PipelineOfflineTests(unittest.TestCase):
             outside = fixtures.make_ios_backup(os.path.join(d, "finder-backup", "UDID9"), cs)
             with self.assertRaises(pipeline.PipelineError):
                 pipeline.inject(work, backup_folder=outside, out=logs.append)
+
+    def _migrated(self, d: str, *, business: bool = False) -> tuple[pipeline.Work, str]:
+        """A work folder that has run convert + inject, with an untouched pristine copy."""
+        work = pipeline.Work(os.path.join(d, "work"))
+        os.makedirs(work.path("android", "Databases"))
+        fixtures.make_msgstore(work.msgstore_db)
+        fixtures.make_media_tree(work.path("android", "Media"))
+        cs = os.path.join(d, "ChatStorage.sqlite")
+        fixtures.make_chatstorage(cs)
+        folder = fixtures.make_ios_backup(os.path.join(work.backup_root, "UDID1"), cs, business=business)
+        with iosbackup.Backup(folder) as b:
+            b.put(iosbackup.WA_GROUP_DOMAIN, "Library/other-app.plist", cs)
+        pristine = os.path.join(work.path("ios_backup_pristine"), "UDID1")
+        shutil.copytree(folder, pristine)
+        work.save(android_pull={"business": business}, ios_backup={"folder": folder, "pristine": pristine})
+        return work, folder
+
+    def test_inject_verifies_and_restore_needs_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            work, folder = self._migrated(d)
+            logs: list[str] = []
+            pipeline.convert(work, out=logs.append)
+            with self.assertRaisesRegex(pipeline.PipelineError, "verification"):
+                pipeline.ios_restore(work, out=logs.append)
+            pipeline.inject(work, out=logs.append)
+            self.assertTrue(work.state["verify"]["ok"])
+            with mock.patch.object(pipeline.device, "restore") as restore:
+                pipeline.ios_restore(work, out=logs.append)
+            restore.assert_called_once()
+
+    def test_verify_catches_a_change_outside_the_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            work, folder = self._migrated(d)
+            logs: list[str] = []
+            pipeline.convert(work, out=logs.append)
+            pipeline.inject(work, out=logs.append)
+            with iosbackup.Backup(folder) as b:
+                entry = b.get(iosbackup.WA_GROUP_DOMAIN, "Library/other-app.plist")
+                path = b.blob_path(entry.file_id)
+            with open(path, "ab") as fh:
+                fh.write(b"x")
+            with self.assertRaisesRegex(pipeline.PipelineError, "content differs: .*other-app"):
+                pipeline.verify(work, out=logs.append)
+            self.assertFalse(work.state["verify"].get("ok"))
+            with self.assertRaises(pipeline.PipelineError):
+                pipeline.ios_restore(work, out=logs.append)
+
+    def test_verify_catches_a_new_file_in_another_app(self):
+        with tempfile.TemporaryDirectory() as d:
+            work, folder = self._migrated(d)
+            logs: list[str] = []
+            pipeline.convert(work, out=logs.append)
+            pipeline.inject(work, out=logs.append)
+            with iosbackup.Backup(folder) as b:
+                b.put("AppDomain-some.other.app", "Documents/x", work.msgstore_db)
+            with self.assertRaisesRegex(pipeline.PipelineError, "added outside"):
+                pipeline.verify(work, out=logs.append)
+
+    def test_business_writes_only_to_its_own_domain(self):
+        with tempfile.TemporaryDirectory() as d:
+            work, folder = self._migrated(d, business=True)
+            logs: list[str] = []
+            pipeline.convert(work, out=logs.append)
+            pipeline.inject(work, out=logs.append)
+            self.assertEqual(work.state["convert"]["domain"], iosbackup.WA_BUSINESS_GROUP_DOMAIN)
+            self.assertTrue(work.state["verify"]["ok"])
+            with iosbackup.Backup(folder, read_only=True) as b:
+                self.assertTrue(b.list_domain(iosbackup.WA_BUSINESS_GROUP_DOMAIN, "Message/Media/"))
+                self.assertFalse(b.list_domain(iosbackup.WA_GROUP_DOMAIN, "Message/Media/"))
+
+    def test_owner_comes_from_the_target_app(self):
+        with tempfile.TemporaryDirectory() as d:
+            work, folder = self._migrated(d, business=True)
+            domain = iosbackup.WA_BUSINESS_GROUP_DOMAIN
+            prefs = os.path.join(d, "prefs.plist")
+            with open(prefs, "wb") as fh:
+                plistlib.dump({"LastOwnJabberID": fixtures.ME}, fh)
+            with iosbackup.Backup(folder) as b:
+                b.put(domain, "Library/Preferences/group.net.whatsapp.WhatsAppSMB.shared.plist", prefs)
+            with iosbackup.Backup(folder, read_only=True) as b:
+                self.assertEqual(b.owner_jid(domain), fixtures.ME)
+
+    def test_restore_payload_holds_only_what_changed(self):
+        with tempfile.TemporaryDirectory() as d:
+            work, folder = self._migrated(d, business=True)
+            logs: list[str] = []
+            pipeline.convert(work, out=logs.append)
+            pipeline.inject(work, out=logs.append)
+            scoped = work.state["verify"]["scoped"]
+            with iosbackup.Backup(scoped, read_only=True) as b:
+                rows = b.conn.execute("SELECT domain, relativePath, flags FROM Files").fetchall()
+                self.assertEqual({r["domain"] for r in rows}, {iosbackup.WA_BUSINESS_GROUP_DOMAIN})
+                names = {r["relativePath"] for r in rows}
+                self.assertTrue({"", "ChatStorage.sqlite", "ChatStorage.sqlite-wal", "ChatStorage.sqlite-shm",
+                                 "Message", "Message/Media"} <= names)   # "" is the app's root: iOS needs it
+                self.assertFalse([n for n in names if "other-app" in n])
+                for r in rows:
+                    if r["flags"] == iosbackup.FLAG_FILE:
+                        entry = b.get(r["domain"], r["relativePath"])
+                        self.assertTrue(os.path.isfile(b.blob_path(entry.file_id)), r["relativePath"])
+                wal = b.get(iosbackup.WA_BUSINESS_GROUP_DOMAIN, "ChatStorage.sqlite-wal")
+                self.assertEqual(os.path.getsize(b.blob_path(wal.file_id)), 0)
+            with mock.patch.object(pipeline.device, "restore") as restore:
+                pipeline.ios_restore(work, out=logs.append)
+            self.assertEqual(restore.call_args[0][0], os.path.dirname(scoped))
+            self.assertTrue(restore.call_args[1]["skip_apps"])
+            with open(os.path.join(scoped, "Info.plist"), "rb") as fh:
+                self.assertNotIn("Applications", plistlib.load(fh))
+
+    def test_rollback_refuses_a_backup_without_regular_whatsapps_chats(self):
+        with tempfile.TemporaryDirectory() as d:
+            work, _folder = self._migrated(d, business=True)        # the fixture has Business only
+            with open(os.path.join(work.state["ios_backup"]["pristine"], "Info.plist"), "wb") as fh:
+                plistlib.dump({"Installed Applications": ["net.whatsapp.WhatsApp"]}, fh)
+            with mock.patch.object(pipeline.device, "restore") as restore:
+                with self.assertRaisesRegex(pipeline.PipelineError, "regular WhatsApp"):
+                    pipeline.ios_rollback(work, out=lambda *_: None)
+            restore.assert_not_called()
+
+    def test_refuses_a_chat_database_with_no_real_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            work, folder = self._migrated(d)
+            cs = os.path.join(d, "empty.sqlite")
+            fixtures.make_chatstorage(cs, with_existing_alice=False)
+            with iosbackup.Backup(folder) as b:
+                b.put(iosbackup.WA_GROUP_DOMAIN, iosbackup.CHATSTORAGE, cs)
+            shutil.rmtree(work.state["ios_backup"]["pristine"])
+            shutil.copytree(folder, work.state["ios_backup"]["pristine"])
+            with self.assertRaisesRegex(pipeline.PipelineError, "hasn't written any messages"):
+                pipeline.convert(work, out=lambda *_: None)
+
+    def test_crypt14_only_explains_the_way_forward(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "msgstore.db.crypt14"), "w").close()
+            with self.assertRaisesRegex(pipeline.PipelineError, "64-digit key"):
+                pipeline.newest_crypt15(d)
+
+    def test_probe_reports_structure_and_no_message_text(self):
+        with tempfile.TemporaryDirectory() as d:
+            work, folder = self._migrated(d)
+            logs: list[str] = []
+            pipeline.convert(work, out=logs.append)
+            pipeline.inject(work, out=logs.append)
+            text = probe.report(folder)
+            self.assertIn("ZMEDIALOCALPATH: 4 rows, first segment [('Media', 4)]", text)
+            self.assertIn("file exists as stored 0, under Message/ 4", text)
+            self.assertIn("reactions: 2", text)
+            self.assertNotIn("hi from alice", text)
+            self.assertNotIn(fixtures.ALICE, text)
 
     def test_msgstore_path_with_special_chars(self):
         with tempfile.TemporaryDirectory() as d:

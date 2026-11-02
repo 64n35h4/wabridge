@@ -16,7 +16,7 @@ import re
 import sqlite3
 from collections.abc import Iterable
 
-from ..model import Archive, Chat, Location, Media, Message, MsgKind, Participant
+from ..model import Archive, Chat, Location, Media, Message, MsgKind, Participant, Quote, Reaction
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +41,13 @@ ANDROID_TYPE_MAP: dict[int, MsgKind] = {
 }
 
 STATUS_BROADCAST = "status@broadcast"
+
+# What a reply shows when the quoted message has no text of its own.
+QUOTE_LABELS: dict[MsgKind, str] = {
+    MsgKind.IMAGE: "Photo", MsgKind.VIDEO: "Video", MsgKind.AUDIO: "Audio", MsgKind.VOICE: "Voice message",
+    MsgKind.DOCUMENT: "Document", MsgKind.GIF: "GIF", MsgKind.STICKER: "Sticker", MsgKind.CONTACT: "Contact",
+    MsgKind.LOCATION: "Location",
+}
 
 
 class MsgstoreError(Exception):
@@ -150,6 +157,8 @@ def parse(path: str, *, contacts: dict[str, str] | None = None, owner_jid: str |
             if not chat:
                 continue
             ujid = lid_map.get(row["user_jid"], row["user_jid"])
+            if "@" not in ujid:                # "status_me" / "lid_me": Android's placeholder for the account itself
+                continue
             chat.participants.append(Participant(
                 jid=ujid, name=resolve_name(ujid, contacts) or lid_names.get(ujid),
                 is_admin=int(row["rank"] or 0) > 0,
@@ -167,14 +176,25 @@ def parse(path: str, *, contacts: dict[str, str] | None = None, owner_jid: str |
         else:
             select_extra.extend(f"NULL AS {c}" for c in cols)
 
-    opt_join("message_media", ["file_path", "file_size", "mime_type", "media_name",
+    opt_join("message_media", ["file_path", "file_size", "file_length", "file_hash", "mime_type", "media_name",
                                "media_duration", "width", "height", "media_caption"])
     opt_join("message_location", ["latitude", "longitude", "place_name", "place_address"])
+    opt_join("message_revoked", ["revoked_key_id"])
     if schema.has("message_quoted", "key_id"):
         joins.append("LEFT JOIN message_quoted ON message_quoted.message_row_id = message._id")
         select_extra.append("message_quoted.key_id AS quoted_key_id")
+        for col, alias in (("from_me", "quoted_from_me"), ("text_data", "quoted_text"),
+                           ("message_type", "quoted_type")):
+            select_extra.append(f"message_quoted.{col} AS {alias}" if schema.has("message_quoted", col)
+                                else f"NULL AS {alias}")
+        if schema.has("message_quoted", "sender_jid_row_id"):
+            joins.append("LEFT JOIN jid quoted_sender ON quoted_sender._id = message_quoted.sender_jid_row_id")
+            select_extra.append("quoted_sender.raw_string AS quoted_sender_jid")
+        else:
+            select_extra.append("NULL AS quoted_sender_jid")
     else:
-        select_extra.append("NULL AS quoted_key_id")
+        select_extra.extend(f"NULL AS {c}" for c in ("quoted_key_id", "quoted_from_me", "quoted_text",
+                                                     "quoted_type", "quoted_sender_jid"))
     if schema.has("message_vcard", "vcard"):
         joins.append(
             "LEFT JOIN message_vcard ON message_vcard._id = "
@@ -197,6 +217,7 @@ def parse(path: str, *, contacts: dict[str, str] | None = None, owner_jid: str |
         ORDER BY message.chat_row_id, message.timestamp, message._id
     """
     n_skipped = 0
+    by_row_id: dict[int, tuple[Chat, Message]] = {}
     for row in conn.execute(msg_sql):
         chat = chats.get(row["chat_row_id"])
         if chat is None:
@@ -217,9 +238,11 @@ def parse(path: str, *, contacts: dict[str, str] | None = None, owner_jid: str |
         if row["file_path"] or kind in (MsgKind.IMAGE, MsgKind.VIDEO, MsgKind.AUDIO, MsgKind.DOCUMENT,
                                         MsgKind.GIF, MsgKind.STICKER):
             media = Media(
-                android_path=row["file_path"], mime_type=row["mime_type"], size=row["file_size"],
+                android_path=row["file_path"], mime_type=row["mime_type"],
+                size=row["file_size"] or row["file_length"],
                 duration_s=row["media_duration"], width=row["width"], height=row["height"],
                 file_name=row["media_name"], caption=row["media_caption"] or row["text_data"],
+                file_hash=row["file_hash"],
             )
             if kind is MsgKind.AUDIO and _is_voice_note(row["mime_type"], row["file_path"]):
                 kind = MsgKind.VOICE
@@ -235,15 +258,28 @@ def parse(path: str, *, contacts: dict[str, str] | None = None, owner_jid: str |
         if sender:
             sender = lid_map.get(sender, sender)
         text = row["text_data"]
-        if kind is MsgKind.UNKNOWN and not text:
-            text = "[Unsupported message type from Android — not migrated]"
+        if kind in (MsgKind.TEXT, MsgKind.UNKNOWN) and not text:   # e.g. types 90, 99: no content to show
+            n_skipped += 1
+            continue
 
-        chat.messages.append(Message(
+        quote = None
+        if row["quoted_key_id"]:
+            quoted_kind = ANDROID_TYPE_MAP.get(int(row["quoted_type"] or 0), MsgKind.UNKNOWN)
+            quote = Quote(key_id=row["quoted_key_id"], from_me=bool(row["quoted_from_me"]),
+                          sender_jid=row["quoted_sender_jid"],
+                          text=row["quoted_text"] or QUOTE_LABELS.get(quoted_kind, "Message"))
+
+        message = Message(
             key_id=row["key_id"], from_me=bool(row["from_me"]), timestamp_ms=int(row["timestamp"]),
             kind=kind, text=text, sender_jid=None if row["from_me"] else sender,
-            media=media, location=location, vcard=row["vcard"], quoted_key_id=row["quoted_key_id"],
-            starred=bool(row["starred"]), android_status=row["status"], android_type=int(mtype),
-        ))
+            media=media, location=location, vcard=row["vcard"], quoted_key_id=row["quoted_key_id"], quote=quote,
+            revoked_key_id=row["revoked_key_id"], starred=bool(row["starred"]), android_status=row["status"],
+            android_type=int(mtype),
+        )
+        chat.messages.append(message)
+        by_row_id[row["id"]] = (chat, message)
+
+    _load_reactions(conn, schema, by_row_id)
 
     conn.close()
     result = [c for c in chats.values() if c.messages]
@@ -262,7 +298,28 @@ def parse(path: str, *, contacts: dict[str, str] | None = None, owner_jid: str |
                 n = resolve_name(m.sender_jid, contacts) or lid_names.get(m.sender_jid)
                 if n:
                     names[m.sender_jid] = n
-    return Archive(owner_jid=owner_jid, chats=result, contacts=names)
+    return Archive(owner_jid=owner_jid, chats=result, contacts=names, phone_to_lid=phone_to_lid)
+
+
+def _load_reactions(conn: sqlite3.Connection, schema: _Schema,
+                    by_row_id: dict[int, tuple[Chat, Message]]) -> None:
+    if not schema.has("message_add_on_reaction") or not schema.has("message_add_on"):
+        return
+    for row in conn.execute("""
+        SELECT a.parent_message_row_id AS parent, a.key_id, a.from_me, r.reaction, r.sender_timestamp,
+               j.raw_string AS sender_jid
+        FROM message_add_on a
+        JOIN message_add_on_reaction r ON r.message_add_on_row_id = a._id
+        LEFT JOIN jid j ON j._id = a.sender_jid_row_id
+    """):
+        target = by_row_id.get(row["parent"])
+        if target is None or not row["reaction"]:      # an empty reaction means it was taken back
+            continue
+        chat, message = target
+        sender = None if row["from_me"] else (row["sender_jid"] or chat.lid or chat.jid)
+        message.reactions.append(Reaction(key_id=row["key_id"], emoji=row["reaction"],
+                                          timestamp_ms=int(row["sender_timestamp"] or 0),
+                                          from_me=bool(row["from_me"]), sender_jid=sender))
 
 
 def _is_voice_note(mime: str | None, path: str | None) -> bool:

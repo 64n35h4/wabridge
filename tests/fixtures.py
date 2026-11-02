@@ -6,17 +6,25 @@ Real databases have many more columns; the writer/parsers only rely on the ones 
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 import plistlib
 import sqlite3
 
-from wabridge.ios.backup import CHATSTORAGE, WA_GROUP_DOMAIN, build_mbfile, file_id
+from wabridge.ios.backup import CHATSTORAGE, WA_BUSINESS_GROUP_DOMAIN, WA_GROUP_DOMAIN, build_mbfile, file_id
+
+IMAGE_BYTES = b"\xff\xd8jpegdata"
 
 ME = "61400000001@s.whatsapp.net"
 ALICE = "61400000002@s.whatsapp.net"
 BOB_LID = "123456789012345@lid"
 BOB_PN = "61400000003@s.whatsapp.net"
 GROUP = "61400000001-1700000000@g.us"
+
+
+def sha256_b64(data: bytes) -> str:
+    return base64.b64encode(hashlib.sha256(data).digest()).decode()
 
 
 def make_msgstore(path: str) -> None:
@@ -88,13 +96,40 @@ def make_msgstore(path: str) -> None:
     c.execute("INSERT INTO message_location VALUES (104, 10, -37.81, 144.96, 'Melbourne', 'VIC')")
     c.execute("INSERT INTO message_vcard VALUES (1, 105, 'BEGIN:VCARD\nVERSION:3.0\nFN:Bob Example\nTEL:+61400000003\nEND:VCARD')")
     c.execute("INSERT INTO message_quoted VALUES (101, 10, 'K100')")
+    # Columns and tables as they are on a 2026 Android build
+    c.executescript(
+        """
+        ALTER TABLE message_media ADD COLUMN file_length INTEGER;
+        ALTER TABLE message_media ADD COLUMN file_hash TEXT;
+        ALTER TABLE message_quoted ADD COLUMN from_me INTEGER;
+        ALTER TABLE message_quoted ADD COLUMN sender_jid_row_id INTEGER;
+        ALTER TABLE message_quoted ADD COLUMN message_type INTEGER;
+        ALTER TABLE message_quoted ADD COLUMN text_data TEXT;
+        CREATE TABLE message_revoked (message_row_id INTEGER PRIMARY KEY, revoked_key_id TEXT);
+        CREATE TABLE message_add_on (_id INTEGER PRIMARY KEY, chat_row_id INTEGER, from_me INTEGER, key_id TEXT,
+                                     sender_jid_row_id INTEGER, parent_message_row_id INTEGER, timestamp INTEGER,
+                                     message_add_on_type INTEGER);
+        CREATE TABLE message_add_on_reaction (message_add_on_row_id INTEGER PRIMARY KEY, reaction TEXT,
+                                              sender_timestamp INTEGER);
+        """
+    )
+    c.execute("UPDATE message_media SET file_hash=? WHERE message_row_id=102", (sha256_b64(IMAGE_BYTES),))
+    c.execute("INSERT INTO message_revoked VALUES (107, 'ORIG107')")
+    c.execute("INSERT INTO message_quoted VALUES (111, 11, 'K110', 0, 2, 0, 'group msg from alice')")   # text reply
+    c.execute("INSERT INTO message_quoted VALUES (112, 11, 'K999', 1, NULL, 1, NULL)")          # quotes my own photo
+    c.execute(f"INSERT INTO message_add_on VALUES (1, 10, 0, 'R1', 2, 100, {t0 + 1500}, 56)")
+    c.execute(f"INSERT INTO message_add_on VALUES (2, 10, 1, 'R2', NULL, 100, {t0 + 1600}, 56)")
+    c.execute(f"INSERT INTO message_add_on VALUES (3, 10, 1, 'R3', NULL, 102, {t0 + 3500}, 56)")
+    c.execute(f"INSERT INTO message_add_on_reaction VALUES (1, '❤️', {t0 + 1500})")
+    c.execute(f"INSERT INTO message_add_on_reaction VALUES (2, '👍', {t0 + 1600})")
+    c.execute(f"INSERT INTO message_add_on_reaction VALUES (3, '', {t0 + 3500})")               # taken back
     conn.commit()
     conn.close()
 
 
 def make_media_tree(root: str) -> None:
     files = {
-        "WhatsApp Images/IMG-001.jpg": b"\xff\xd8jpegdata",
+        "WhatsApp Images/IMG-001.jpg": IMAGE_BYTES,
         "WhatsApp Voice Notes/202437/PTT-001.opus": b"OggS-opus",
         "WhatsApp Stickers/STK-001.webp": b"RIFFwebp",
         "WhatsApp Documents/report.pdf": b"%PDF-1.4",
@@ -139,7 +174,9 @@ def make_chatstorage(path: str, *, with_existing_alice: bool = True) -> None:
         CREATE TABLE ZWAMEDIAITEM (Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, Z_OPT INTEGER, ZCLOUDSTATUS INTEGER,
             ZFILESIZE INTEGER, ZMEDIAORIGIN INTEGER, ZMOVIEDURATION INTEGER, ZMESSAGE INTEGER, ZLATITUDE FLOAT,
             ZLONGITUDE FLOAT, ZMEDIALOCALPATH VARCHAR, ZMEDIAURL VARCHAR, ZTITLE VARCHAR, ZVCARDNAME VARCHAR,
-            ZVCARDSTRING VARCHAR, ZXMPPTHUMBPATH VARCHAR, ZMEDIAKEY BLOB, ZMETADATA BLOB);
+            ZVCARDSTRING VARCHAR, ZXMPPTHUMBPATH VARCHAR, ZAUTHORNAME VARCHAR, ZMEDIAKEY BLOB, ZMETADATA BLOB);
+        CREATE TABLE ZWAMESSAGEINFO (Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, Z_OPT INTEGER, ZMESSAGE INTEGER,
+            ZRECEIPTINFO BLOB);
         CREATE TABLE ZWAGROUPMEMBER (Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, Z_OPT INTEGER, ZISACTIVE INTEGER,
             ZISADMIN INTEGER, ZCHATSESSION INTEGER, ZCONTACTNAME VARCHAR, ZMEMBERJID VARCHAR);
         CREATE TABLE ZWAGROUPINFO (Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, Z_OPT INTEGER, ZGENERATION INTEGER,
@@ -165,11 +202,14 @@ def make_chatstorage(path: str, *, with_existing_alice: bool = True) -> None:
     conn.close()
 
 
-def make_ios_backup(root: str, chatstorage_src: str) -> str:
+def make_ios_backup(root: str, chatstorage_src: str, *, business: bool = False) -> str:
     """Minimal unencrypted backup folder containing WhatsApp's ChatStorage.sqlite."""
+    domain = WA_BUSINESS_GROUP_DOMAIN if business else WA_GROUP_DOMAIN
     os.makedirs(root, exist_ok=True)
     with open(os.path.join(root, "Manifest.plist"), "wb") as fh:
         plistlib.dump({"IsEncrypted": False, "Version": "10.0", "Applications": {}, "Lockdown": {}}, fh)
+    with open(os.path.join(root, "Info.plist"), "wb") as fh:
+        plistlib.dump({"Applications": {"net.whatsapp.WhatsApp": {}}}, fh)
     with open(os.path.join(root, "Status.plist"), "wb") as fh:
         plistlib.dump({"BackupState": "new", "IsFullBackup": True, "Version": "3.3"}, fh)
     conn = sqlite3.connect(os.path.join(root, "Manifest.db"))
@@ -180,16 +220,19 @@ def make_ios_backup(root: str, chatstorage_src: str) -> str:
         """
     )
     size = os.path.getsize(chatstorage_src)
-    fid = file_id(WA_GROUP_DOMAIN, CHATSTORAGE)
+    fid = file_id(domain, CHATSTORAGE)
     blob = build_mbfile(CHATSTORAGE, size, 0o100644, 1_700_000_000, 424242)
-    conn.execute("INSERT INTO Files VALUES (?,?,?,?,?)", (fid, WA_GROUP_DOMAIN, CHATSTORAGE, 1, blob))
+    conn.execute("INSERT INTO Files VALUES (?,?,?,?,?)", (fid, domain, CHATSTORAGE, 1, blob))
+    conn.execute("INSERT INTO Files VALUES (?,?,?,?,?)",
+                 (file_id(domain, ""), domain, "", 2,
+                  build_mbfile("", 0, 0o040775, 1_700_000_000, 424240, protection_class=0)))
     # a pre-existing directory row and a WAL sibling, as real backups often have
     conn.execute("INSERT INTO Files VALUES (?,?,?,?,?)",
-                 (file_id(WA_GROUP_DOMAIN, "Message"), WA_GROUP_DOMAIN, "Message", 2,
+                 (file_id(domain, "Message"), domain, "Message", 2,
                   build_mbfile("Message", 0, 0o040775, 1_700_000_000, 424243, protection_class=0)))
-    wal_fid = file_id(WA_GROUP_DOMAIN, CHATSTORAGE + "-wal")
+    wal_fid = file_id(domain, CHATSTORAGE + "-wal")
     conn.execute("INSERT INTO Files VALUES (?,?,?,?,?)",
-                 (wal_fid, WA_GROUP_DOMAIN, CHATSTORAGE + "-wal", 1,
+                 (wal_fid, domain, CHATSTORAGE + "-wal", 1,
                   build_mbfile(CHATSTORAGE + "-wal", 0, 0o100644, 1_700_000_000, 424244)))
     conn.commit()
     conn.close()

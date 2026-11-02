@@ -35,7 +35,8 @@ class FakePhones:
         self.media_src = os.path.join(tmp, "phone_media")
         fixtures.make_media_tree(self.media_src)
         self.cs = os.path.join(tmp, "ChatStorage.sqlite")
-        fixtures.make_chatstorage(self.cs, with_existing_alice=False)
+        fixtures.make_chatstorage(self.cs)
+        self.products = {"whatsapp": "/sdcard/Android/media/com.whatsapp/WhatsApp"}
         self.restores: list[dict] = []
         self.will_encrypt = True
         self.android_polls = 0
@@ -76,7 +77,7 @@ class FakePhones:
             progress(50.0)
         return folder
 
-    def restore(self, backup_dir, udid=None, *, system=False, reboot=True, progress=None):
+    def restore(self, backup_dir, udid=None, *, system=False, reboot=True, skip_apps=False, progress=None):
         self.restores.append({"dir": backup_dir, "system": system})
 
 
@@ -88,6 +89,7 @@ class WizardTests(unittest.TestCase):
         patches = [
             mock.patch.object(adb, "find_adb", return_value="/fake/adb"),
             mock.patch.object(adb, "devices", phones.devices),
+            mock.patch.object(adb, "detect_products", return_value=phones.products),
             mock.patch.object(adb, "detect_wa_root", return_value="/sdcard/Android/media/com.whatsapp/WhatsApp"),
             mock.patch.object(adb, "has_crypt15", return_value=True),
             mock.patch.object(adb, "pull_databases", phones.pull_databases),

@@ -15,3 +15,17 @@ ChatStorage.sqlite*
 tools/
 .omc/
 gui/screenshots/
+plan/
+.DS_Store
+# Backups, keys and anything else from a real phone: never commit these
+Manifest.db
+Manifest.plist
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.key
+.key
+*.vcf
+contacts.json
+evidence/
+*-evidence/

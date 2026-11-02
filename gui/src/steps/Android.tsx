@@ -52,6 +52,7 @@ export function AndroidStep({ onNext }: { onNext: () => void }) {
   // "checking WhatsApp" forever.
   const [checkError, setCheckError] = useState<EngineError | null>(null);
   const checking = useRef(false);
+  const [business, setBusiness] = useState<boolean | undefined>(undefined);
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -64,7 +65,7 @@ export function AndroidStep({ onNext }: { onNext: () => void }) {
     if (check?.has_crypt15 || checking.current) return;
     checking.current = true;
     client
-      .request<AndroidCheck>("android.check", { serial: phone?.serial })
+      .request<AndroidCheck>("android.check", { serial: phone?.serial, business })
       .then((c) => {
         if (!mounted.current) return;
         setCheck(c);
@@ -77,7 +78,7 @@ export function AndroidStep({ onNext }: { onNext: () => void }) {
         checking.current = false;
       });
     // `devices` in the deps makes this run once per poll tick.
-  }, [connected, check?.has_crypt15, activity, fetched, resuming, client, phone?.serial, devices]);
+  }, [connected, check?.has_crypt15, activity, fetched, resuming, client, phone?.serial, devices, business]);
 
   useEffect(() => {
     if (!connected) {
@@ -122,7 +123,7 @@ export function AndroidStep({ onNext }: { onNext: () => void }) {
     if (!keyValid) return;
     setErr(null);
     try {
-      const r = await run<FetchResult>("android.fetch", { serial: phone?.serial, key: keyDigits }, { label: "Decrypting your chats" });
+      const r = await run<FetchResult>("android.fetch", { serial: phone?.serial, key: keyDigits, business: check?.business }, { label: "Decrypting your chats" });
       setFetched(r);
       setKey("");
       setTouched(false);
@@ -198,6 +199,26 @@ export function AndroidStep({ onNext }: { onNext: () => void }) {
 
       {phase === "key" && (
         <>
+          {check && check.products.length > 1 && (
+            <fieldset className="choice">
+              <legend>This phone has both apps. Which one are you moving?</legend>
+              {[false, true].map((b) => (
+                <label key={String(b)}>
+                  <input
+                    type="radio"
+                    name="product"
+                    checked={check.business === b}
+                    disabled={!!activity}
+                    onChange={() => {
+                      setBusiness(b);
+                      setCheck(null);
+                    }}
+                  />{" "}
+                  {b ? "WhatsApp Business" : "WhatsApp"}
+                </label>
+              ))}
+            </fieldset>
+          )}
           {checkError && checkError.code === "no_whatsapp" && (
             <Notice tone="warn" title="WhatsApp isn’t set up on this phone yet">
               <p>Install WhatsApp on the Android phone, sign in, and open it once. WaBridge re-checks every few seconds and this notice goes away on its own.</p>

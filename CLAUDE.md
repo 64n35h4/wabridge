@@ -26,6 +26,7 @@ src/wabridge/
   android/msgstore.py  new-schema msgstore.db parser, LID↔phone mapping (jid_map)
   ios/backup.py        Manifest.db reader/writer, MBFile plist blobs, media injection
   ios/chatstorage.py   ChatStorage.sqlite writer — Core Data via plain SQL; learns conventions from existing rows
+  ios/probe.py         read-only structure report on a backup (`wabridge ios probe <folder>`); no message text
   ios/device.py        pymobiledevice3 11.x (async) wrapper: info/backup/restore/change_password
   pipeline.py          resumable stages + state.json; pristine backup kept as rollback point
   wizard.py            interactive terminal flow (`wabridge wizard`)
@@ -35,7 +36,7 @@ src/wabridge/
 gui/                   Tauri 2 + React/TS desktop app; engine runs as sidecar. See gui/README.md, gui/DESIGN.md
   src/dev/mockEngine.ts    browser stand-in for the engine (dev builds, plain browser): ?mock=android,iphone …
   scripts/screenshots.mjs  Playwright suite, 35 scenes → gui/screenshots/ (`npm run screenshots`)
-tests/                 33 tests, all offline with synthetic fixtures + fake phones (tests/fixtures.py, test_wizard.py FakePhones)
+tests/                 59 tests, all offline with synthetic fixtures + fake phones (tests/fixtures.py, test_wizard.py FakePhones)
 start.sh / start.bat   zero-setup terminal launcher (uv → Python 3.12 → adb → editable install → wizard). `--setup-only` skips launch
 build-app.sh           `bash build-app.sh dev` (Tauri dev, venv-wrapper sidecar) | `bash build-app.sh` (PyInstaller freeze + tauri build)
 .github/workflows/     ci.yml (pytest + ruff on 3 OSes), release.yml (tauri-action installers on v* tags)
@@ -60,12 +61,19 @@ iOS current build, pymobiledevice3 11.16.3):
   injection, restore (Find My must be OFF; error MBErrorDomain/211 otherwise), **text + group chats
   appear correctly in WhatsApp on the iPhone**.
 
+Verified on a real device, 2026-11-02 (Pixel 8 Pro, Android 17 → iPhone 18 Pro Max, iOS 27.2, WhatsApp Business
+2.26.42.77, pymobiledevice3 11.x), about 380,000 messages:
+- **Business → Business, media, reactions, stickers and replies appear correctly**, by my own check in the app. The
+  media bug's cause is proven: ZMEDIALOCALPATH is relative to `Message/` and I had written the prefix. The run used
+  the `pipeline` stages from a script, with the backup taken by `device.backup`, not the CLI, wizard or GUI.
+- A scoped restore must include the domain root row (relativePath ""): without it the iPhone fails with
+  `renameatx_np … No such file or directory … .backup.i/…/ChatStorage.sqlite` (MBErrorDomain/4), and that failed attempt
+  changed nothing I could see. Stolen Device Protection must be off as well as Find My.
+
 NOT verified / open:
-- **Media (parked by owner — he does not want to run more restores for now).** Media bubbles render
-  but files don't open. Most likely cause fixed in code but untested: injected *directory* rows in
-  Manifest.db had Mode 0o40755 / ProtectionClass 3; iOS writes 0o40775 / ProtectionClass 0; also
-  removed a `Digest` field iOS never writes. Next candidates in DESIGN.md §7 item 1 (ZMETADATA blob,
-  thumbnails). Do not claim media works until someone confirms on a device.
+- Deleted markers, documents and voice notes were written from real rows and not individually checked. `ZDOCID` is 0 on
+  my rows, so in-app search may miss them. Whether the full restore reset the phone as the one-file test did was not
+  recorded. `wabridge ios backup` raises "data is not in this backup" whenever it can't see the target's ChatStorage.
 - **Desktop app: boots, and the Android + iPhone steps ran with real phones; Transfer not yet.**
   Verified 2026-09-23 on the owner's Mac: `bash build-app.sh dev` and the production
   `bash build-app.sh` (PyInstaller freeze → `WaBridge.app` + `WaBridge_0.1.0_aarch64.dmg`, 44 MB,
@@ -75,25 +83,41 @@ NOT verified / open:
   iPhone backup (~41 GB, passcode prompt shown in the app, pristine copy made) ran through the GUI
   on the Fold4 and iPhone 13. Still unrun: the Transfer step with phones (a restore — owner's
   call), release.yml, Windows, Linux.
-- Quotes/replies, reactions, edits, group events (skipped by default), WhatsApp Business (wired,
-  untested), legacy pre-2022 Android schema (unsupported), iOS→Android (model layer is ready).
+- Group events aren't written (ZGROUPEVENTTYPE codes unmapped), the "Edited" label, legacy pre-2022 Android
+  schema (unsupported), iOS→Android (model layer is ready).
 
 ## Hard-won facts (do not rediscover)
 
 WhatsApp iOS ChatStorage (2025/26 builds):
 - `ZWAMESSAGE.ZPUSHNAME` and `ZWACHATSESSION.ZLASTMESSAGETEXT` hold **base64 protobuf**, not text.
   Writing plain text there → "having trouble reading your chat history" + crash on recovery.
-- Every message: ZFLAGS 16777216 (incoming) / 16777280 (outgoing), ZDATAITEMVERSION 3,
-  ZSPOTLIGHTSTATUS −32768, ZLASTSESSION = ZCHATSESSION. Numeric columns that are never NULL in
+- Every message: ZFLAGS 0x1000000 (0x5000000 on files), ZDATAITEMVERSION 3, ZSPOTLIGHTSTATUS −32768,
+  ZGROUPEVENTTYPE 2, ZSTARRED 1 or NULL. ZSENTDATE only on revoked rows. ZLASTSESSION only on the row that is
+  its session's ZLASTMESSAGE. ZFROMJID/ZTOJID as `chatstorage.py`'s docstring. Numeric columns that are never NULL in
   WhatsApp's own rows must not be NULL in ours (Core Data non-optional scalars) — the writer learns
   these from existing rows (`Writer._learn_conventions`, `_never_null_numeric`).
 - 1:1 sessions are keyed by `<n>@lid` in ZCONTACTJID with the phone JID in ZCONTACTIDENTIFIER
   (ZFLAGS 272, ZSPOTLIGHTSTATUS −5); groups ZFLAGS 256, ZSPOTLIGHTSTATUS 1. ZWACHATPROPERTIES unused.
-- MIME type does NOT go in ZVCARDSTRING (that's for real vCards). ZMEDIASECTIONID = "YYYY-MM".
+- Media rows: ZVCARDSTRING = MIME (or a real vCard on contact rows), ZVCARDNAME = base64 SHA-256 of the file (same as
+  Android's file_hash; link files by this, not by name), ZMEDIALOCALPATH and ZXMPPTHUMBPATH relative to `Message/`,
+  no file = NULL path and the bubble still shows. ZMEDIASECTIONID = "YYYY-MM", only when the file exists, not for
+  stickers or voice. Documents: file name in ZTEXT and ZAUTHORNAME.
+- Replies: ZWAMEDIAITEM.ZMETADATA protobuf (5 quoted id, 6 sender, 19 quoted message, 211 = 0), not ZPARENTMESSAGE.
+  Reactions: ZWAMESSAGEINFO.ZRECEIPTINFO field 7. Details in `chatstorage.py`'s docstring.
+- Conventions need a sample: a Writer learns from ≥ 20 rows (MIN_SAMPLE), and convert refuses a target with no
+  messages. Plain text never goes in ZPUSHNAME / ZLASTMESSAGETEXT unless real rows show it.
+- Several accounts in one app: an added account has a full parallel set under `data/<UUID>/`. WaBridge writes only the
+  main account. Business has its own domain and no ChatStorage.sqlite until someone logs in there.
+- LIDs: in a @lid session ZFROMJID/ZTOJID are the LID (632 of 632). Active group members are always @lid (3,393 of
+  3,393); phone-form members are always inactive (782 of 782). WhatsApp syncs groups and members at login, so history
+  merges into them: write people by LID when known (`Archive.phone_to_lid`) or they appear twice. Revoked ZVCARDNAME is
+  the session's ZCONTACTJID (515 of 515). Android's `status_me`/`lid_me` placeholders are not members.
 - Z_ENT comes from Z_PRIMARYKEY by name; bump Z_MAX after inserts; convert always starts from the
   pristine ChatStorage so re-runs (e.g. media pass) rebuild rather than dedupe.
 
 Android:
+- Business paths: `/sdcard/Android/media/com.whatsapp.w4b/WhatsApp Business`, media folders `WhatsApp Business Images`
+  and so on, but old rows keep `Media/WhatsApp Images/...`. Without E2E backups are `.crypt14`, unreadable unrooted.
 - E2E backup with 64-digit key makes the LOCAL `Android/media/com.whatsapp/WhatsApp/Databases/
   msgstore.db.crypt15` decryptable; adb pull works unrooted (Android 11–15).
 - message_type 20 = sticker, 15 = revoked (common mix-up). wa.db needs root → names come from the
@@ -140,6 +164,11 @@ Tauri/GUI gotchas already handled:
 1. Never hard-code schema assumptions you can introspect (PRAGMA table_info, Z_PRIMARYKEY, existing rows).
 2. Every pipeline stage must be re-runnable; never corrupt earlier outputs; never touch the Android phone.
 3. Only modify backups inside the work dir; keep the pristine copy untouched; `Backup.__exit__` rolls back on error.
+   `inject` runs `verify`, which proves every file outside the target app is byte-identical to pristine; `ios restore`
+   refuses without it. Open pristine with `Backup(read_only=True)`.
+   `ios restore` sends only the changed files, but that is never harmless: one test (iOS 27.2) ran the setup
+   assistant, reset settings and home layout, and redownloaded apps. Other apps' data survived. Warn before any restore.
+   Build a test merge with a real logged-in target: WhatsApp syncs groups at login, and a synthetic target hid four bugs.
 4. Nothing personal in git: `wabridge-work/`, `tools/`, `*.crypt15`, `msgstore*.db`, `ChatStorage.sqlite*` are ignored.
    (Note: `tools/platform-tools` was committed once by mistake — `git rm -r --cached tools` if still tracked.)
 5. Mark inferred-but-unverified behaviour with "unverified" in code comments and DESIGN.md §7.
@@ -151,7 +180,5 @@ Tauri/GUI gotchas already handled:
    the Transfer screen): `bash build-app.sh dev`, or open the built
    `gui/src-tauri/target/release/bundle/macos/WaBridge.app`. Fix what the first run with hardware shows.
    Then tag `v0.2.0` and check what release.yml produces (never run).
-2. README checklist: quotes/replies (`ZPARENTMESSAGE`), reactions (`message_add_on_reaction`), edits,
-   group events, WhatsApp Business, legacy schema; PyPI publish.
-3. Media, only when the owner is willing to restore again: receive one photo natively on the iPhone,
-   take a backup, diff that ZWAMEDIAITEM row + its Manifest.db entry against ours.
+2. Run a Business migration through `migrate --business`, the wizard and the desktop app. Only the stages have run.
+3. Group events: map Android `message_system.action_type` to ZGROUPEVENTTYPE with test messages. The "Edited" label.

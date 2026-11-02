@@ -325,24 +325,33 @@ class Engine:
                 out["iphone_error"] = (str(e).splitlines() or [type(e).__name__])[0]
         return out
 
-    def cmd_android_check(self, rep: Reporter, serial: str | None = None) -> dict:
+    def _android_root(self, serial: str, business: bool | None) -> tuple[str, bool, list[str]]:
+        """The app to move. Unspecified means regular WhatsApp if the phone has it."""
+        products = adb.detect_products(serial)
+        if business is None:
+            business = "whatsapp" not in products
+        root = products.get("business" if business else "whatsapp") or adb.detect_wa_root(serial, business)
+        return root, business, sorted(products)
+
+    def cmd_android_check(self, rep: Reporter, serial: str | None = None, business: bool | None = None) -> dict:
         dev = adb.require_device(serial)
-        root = adb.detect_wa_root(dev.serial)
+        root, business, products = self._android_root(dev.serial, business)
         has_crypt15 = adb.has_crypt15(root, dev.serial)
         # `du` over the Media tree takes seconds on a full phone and the GUI re-asks until a backup
         # appears; only pay for it once there is something to decrypt.
         return {
-            "serial": dev.serial, "model": dev.model, "root": root,
+            "serial": dev.serial, "model": dev.model, "root": root, "products": products, "business": business,
             "has_crypt15": has_crypt15,
             "media_bytes": adb.dir_size_bytes(f"{root}/Media", dev.serial) if has_crypt15 else None,
         }
 
     # ---------------------------------------------------------------- heavy actions
-    def cmd_android_fetch(self, rep: Reporter, key: str, serial: str | None = None) -> dict:
+    def cmd_android_fetch(self, rep: Reporter, key: str, serial: str | None = None,
+                          business: bool | None = None) -> dict:
         """Pull the encrypted database, decrypt it with `key`, read contacts, summarise."""
         key_hex = crypt15.parse_key(key).hex()
         dev = adb.require_device(serial)
-        root = adb.detect_wa_root(dev.serial)
+        root, business, _products = self._android_root(dev.serial, business)
         if not adb.has_crypt15(root, dev.serial):
             raise RpcError("no_crypt15", adb.NO_CRYPT15_MSG)
         rep("→ Copying the encrypted database from the phone …")
@@ -354,7 +363,7 @@ class Engine:
                 json.dump(contacts, fh)
             rep(f"  read {len(contacts)} contact numbers for names")
         media_bytes = adb.dir_size_bytes(f"{root}/Media", dev.serial)
-        self.work.save(android_pull={"root": root, "media_dir": None, "business": False, "media_pulled": [],
+        self.work.save(android_pull={"root": root, "media_dir": None, "business": business, "media_pulled": [],
                                      "media_bytes": media_bytes},
                        android_serial=dev.serial)
         summary = self._summary()
@@ -381,7 +390,8 @@ class Engine:
 
     def cmd_android_pull_media(self, rep: Reporter, serial: str | None = None) -> dict:
         dev = adb.require_device(serial or self.work.state.get("android_serial"))
-        root = self.work.state.get("android_pull", {}).get("root") or adb.detect_wa_root(dev.serial)
+        pulled_from = self.work.state.get("android_pull", {})
+        root = pulled_from.get("root") or adb.detect_wa_root(dev.serial, pulled_from.get("business", False))
         rep("→ Copying photos, videos and voice notes (this is the slow part) …")
         pulled = adb.pull_media(self.work.android_dir, root, serial=dev.serial,
                                 percent=lambda p: rep.progress("android_media", p))

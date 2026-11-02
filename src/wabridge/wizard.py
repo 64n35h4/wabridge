@@ -114,9 +114,15 @@ def run(work: pipeline.Work, *, out: Log = print, text_only_first: bool | None =
         )
         out(f"  ✓ Android connected: {dev.model or dev.serial}")
 
-        root = ui.wait("WhatsApp on the phone", lambda: adb.detect_wa_root(dev.serial), hint=(
+        products = ui.wait("WhatsApp on the phone", lambda: adb.detect_products(dev.serial), hint=(
             "  Open WhatsApp on the Android phone once, then come back."
         ))
+        business = "whatsapp" not in products
+        if len(products) > 1:
+            business = ui.ask_yes("This phone has both WhatsApp and WhatsApp Business. Move WhatsApp Business?")
+        root = products["business" if business else "whatsapp"]
+        app = "WhatsApp Business" if business else "WhatsApp"
+        out(f"  ✓ Moving {app}")
 
         if not adb.has_crypt15(root, dev.serial):
             out("  The phone has no end-to-end encrypted (crypt15) backup yet.")
@@ -190,10 +196,10 @@ def run(work: pipeline.Work, *, out: Log = print, text_only_first: bool | None =
             out("  Pulling media — go make a coffee …")
             pulled = adb.pull_media(work.android_dir, root, serial=dev.serial)
             out(f"  ✓ Media pulled: {', '.join(pulled) or 'nothing found'}")
-            work.save(android_pull={"root": root, "media_dir": work.path("android", "Media"), "business": False,
+            work.save(android_pull={"root": root, "media_dir": work.path("android", "Media"), "business": business,
                                     "media_pulled": pulled}, android_serial=dev.serial)
         else:
-            work.save(android_pull={"root": root, "media_dir": None, "business": False, "media_pulled": []},
+            work.save(android_pull={"root": root, "media_dir": None, "business": business, "media_pulled": []},
                       android_serial=dev.serial)
         out("  ✓ Android side done. Your Android chats are untouched; you can unplug that phone.")
     else:
