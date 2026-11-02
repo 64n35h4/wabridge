@@ -39,6 +39,7 @@ class Media:
     height: int | None = None
     file_name: str | None = None      # documents keep their original name
     caption: str | None = None
+    file_hash: str | None = None      # base64 SHA-256 of the file: proves which file belongs to the message
 
     @property
     def basename(self) -> str | None:
@@ -55,6 +56,25 @@ class Location:
 
 
 @dataclass
+class Quote:
+    """The message a reply points at."""
+
+    key_id: str
+    from_me: bool = False
+    sender_jid: str | None = None     # None when from_me, or in a 1:1 chat where it is the chat itself
+    text: str | None = None           # quoted text, or a short label for media ("Photo")
+
+
+@dataclass
+class Reaction:
+    key_id: str
+    emoji: str
+    timestamp_ms: int
+    from_me: bool = False
+    sender_jid: str | None = None
+
+
+@dataclass
 class Message:
     key_id: str                       # WhatsApp stanza/message id (stable across platforms)
     from_me: bool
@@ -66,6 +86,9 @@ class Message:
     location: Location | None = None
     vcard: str | None = None          # raw vCard text for CONTACT messages
     quoted_key_id: str | None = None
+    quote: Quote | None = None
+    reactions: list[Reaction] = field(default_factory=list)
+    revoked_key_id: str | None = None # REVOKED only: Android's `message_revoked.revoked_key_id`
     starred: bool = False
     android_status: int | None = None
     android_type: int | None = None   # raw message_type, kept for debugging
@@ -105,6 +128,7 @@ class Archive:
     owner_jid: str | None
     chats: list[Chat]
     contacts: dict[str, str] = field(default_factory=dict)   # jid -> display name
+    phone_to_lid: dict[str, str] = field(default_factory=dict)   # phone JID -> `<n>@lid`, when Android knows it
 
     def stats(self) -> dict[str, int]:
         msgs = sum(len(c.messages) for c in self.chats)

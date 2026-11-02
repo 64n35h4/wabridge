@@ -4,7 +4,7 @@
 
 The paid tools (Dr.Fone, MobileTrans, Mutsapper, Wazzap Migrator…) all do the same thing under the hood: decrypt the Android database, rewrite it into WhatsApp-for-iOS's `ChatStorage.sqlite`, slip it into an iPhone backup and restore that backup. Every one of those steps can be done with open-source software. WaBridge is that pipeline, automated, GPL-licensed, and free forever.
 
-> **Status: alpha — text migration works on real devices; media does not yet.** Tested 2026-09-22 on Samsung Galaxy Z Fold4 (Android) → iPhone 13 (iOS 27.2): all 57,816 messages across 192 chats and groups restored and open correctly in WhatsApp. Media (photos, videos, voice notes) imported as placeholders that didn't open in that test; a likely cause (directory permissions in the backup manifest) has since been fixed in code but **not yet re-tested on a device** — see DESIGN.md §7. If you run the media pass, please report the result in an issue. **Always keep your Android backup.**
+> **Status: alpha, but the full path has worked on real phones.** Text and group chats first worked on 2026-09-22 (Samsung Galaxy Z Fold4 → iPhone 13, iOS 27.2, regular WhatsApp). On 2026-11-02 a WhatsApp Business history of roughly 380,000 messages moved from a Pixel 8 Pro (Android 17) to an iPhone 18 Pro Max (iOS 27.2), and I confirmed chats, media, reactions, stickers and replies in the app. That is one run on each setup, not a guarantee. **Read [what a restore does to the iPhone](#what-a-restore-does-to-the-iphone) first, and always keep your Android backup.**
 
 ## How it works
 
@@ -25,13 +25,36 @@ iPhone ◀───────────────────────�
 
 The official free path, Apple's *Move to iOS*, also works but requires a **factory-reset** iPhone. WaBridge is for everyone who already set the iPhone up.
 
+### What moves
+
+| Item | State |
+|---|---|
+| Text and group chats | Confirmed on a phone |
+| Contact names | Taken from the Android phone's contacts; a `.vcf` export also works |
+| Photos, videos and other files still on the Android phone | Confirmed on a phone: they transfer and open |
+| Media no longer on the Android phone | The bubble appears, without the file |
+| Replies, reactions, stickers | Confirmed on a phone |
+| Deleted-message markers, documents, voice notes | Written from WhatsApp's real row formats; not individually confirmed |
+| Edited messages | The final text moves; the "Edited" label doesn't |
+| Group events (joined, left, subject changed) | Not moved |
+| WhatsApp Business to WhatsApp Business | Confirmed on a phone. Business labels and quick replies are not moved |
+
+### What a restore does to the iPhone
+
+WaBridge sends only the files it changed, for the one app it targets, and refuses to restore a backup that fails a byte-by-byte check against the untouched copy. Even so, **a restore is never harmless.** In one of my tests on iOS 27.2, a restore of a single file rebooted the iPhone into the setup assistant and reset system data: settings, home screen layout, app groupings and timezone. Find My came back on, and apps redownloaded after signing in to iCloud. Data inside other apps survived in that test, including another WhatsApp's chats, but nobody can promise that on your phone.
+
+Before restoring: back up anything you can't lose, and expect to set the phone up again. Messages that arrive on the iPhone between the backup and the restore can be lost.
+
 ## Requirements
 
 * Python 3.10+
 * [Android platform-tools](https://developer.android.com/tools/releases/platform-tools) (`adb`) on your PATH
 * USB debugging enabled on the Android phone
-* iPhone: WhatsApp installed and activated with the same number; **"Encrypt local backup" turned off**;
-  **Find My iPhone turned off** while restoring (Apple refuses the restore otherwise; turn it back on afterwards)
+* iPhone: the same app (WhatsApp, or WhatsApp Business for a Business history) installed and activated with the same
+  number, with at least one message; **"Encrypt local backup" turned off**; **Stolen Device Protection and Find My iPhone
+  turned off** while restoring (Apple refuses the restore otherwise; turn them back on after checking the result)
+* The Android backup must be end-to-end encrypted with the **64-digit key**. Without it, backups are `.crypt14`,
+  which can't be read without root.
 * Windows only: iTunes (or Apple Mobile Device Support) for the USB driver. Linux: `usbmuxd`. macOS: nothing extra.
 
 ## Desktop app
@@ -42,7 +65,7 @@ phone is needed. Build it with `bash build-app.sh` (Rust + Node 20 required) or 
 with `bash build-app.sh dev`; installers for macOS, Windows and Linux are produced by the release
 workflow on every `v*` tag. Status: it builds, opens and boots the engine on macOS (23 Sept 2026),
 and its Android and iPhone steps have run with real phones (23 Sept 2026); the final restore
-step through the app has not yet — the terminal wizard is the path verified end to end.
+step through the app has not yet. Its WhatsApp Business choice hasn't been run with real phones either.
 See [`gui/README.md`](gui/README.md).
 
 ### What it looks like
@@ -90,7 +113,7 @@ wabridge doctor                     # checks adb, pymobiledevice3, connected dev
 The one-shot command:
 
 ```bash
-wabridge migrate --key "1234 5678 …(64 digits)…"
+wabridge migrate --key "1234 5678 …(64 digits)…"              # add --business for WhatsApp Business
 ```
 
 Or step by step (each step is resumable; everything lands in `./wabridge-work/`):
@@ -101,9 +124,9 @@ wabridge android decrypt --key …       # -> msgstore.db
 wabridge android inspect               # sanity check: chats & message counts
 wabridge ios backup                    # full unencrypted iPhone backup
 wabridge convert [--contacts my.vcf]   # write chats into the backup's ChatStorage.sqlite
-wabridge inject                        # ChatStorage.sqlite + media into the backup
-wabridge ios restore [--system]        # push it back to the iPhone (it will reboot)
-wabridge ios rollback                  # undo: restore the untouched pre-migration backup
+wabridge inject                        # ChatStorage.sqlite + media into the backup, then verifies it
+wabridge ios restore [--system]        # send only the changed files to the iPhone (it will reboot; see the warning above)
+wabridge ios rollback                  # undo: a whole-phone restore of the untouched pre-migration backup
 ```
 
 Step-by-step instructions for non-technical users, including how to find the 64-digit key, are in [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
@@ -119,6 +142,7 @@ src/wabridge/
   ios/backup.py         Manifest.db reader/writer, MBFile blobs, media injection
   ios/chatstorage.py    ChatStorage.sqlite writer (Core Data via plain SQL)
   ios/device.py         pymobiledevice3 wrapper (backup / restore / encryption)
+  ios/probe.py          read-only structure report on a backup, no message text
   pipeline.py           resumable stages + `migrate`
   wizard.py             guided interactive terminal session (polls devices, resumes, logs)
   serve.py              JSON-lines engine for the desktop app (`wabridge serve`)
@@ -127,7 +151,7 @@ src/wabridge/
 gui/                    Tauri 2 + React desktop app (engine runs as a sidecar)
 start.sh / start.bat    zero-setup terminal launchers (uv + Python 3.12 + adb, no admin)
 build-app.sh            build or dev-run the desktop app
-tests/                  synthetic fixtures + 29 tests, no devices required
+tests/                  synthetic fixtures + 59 tests, no devices required
 DESIGN.md               architecture, schema mapping, risks, roadmap
 ```
 
@@ -137,12 +161,16 @@ Run the tests: `python -m unittest discover tests` (or `pytest`).
 
 - [x] Engine: decrypt, parse, convert, inject
 - [x] **Text + group chats migrate on real devices** (verified 2026-09-22)
-- [ ] **Media files open on the iPhone** — bubbles render but files show as missing; help wanted (DESIGN.md §7 item 1)
-- [ ] Replies/quotes, reactions, edited messages
-- [ ] Group event messages (joined/left/subject changed)
-- [ ] WhatsApp Business
+- [x] **Media files open on the iPhone** (verified 2026-11-02). Files still on the phone are linked; the rest show as bubbles with no file
+- [x] Replies/quotes, reactions, stickers (verified 2026-11-02)
+- [ ] Deleted-message markers, documents, voice notes: written from real row formats, not individually confirmed
+- [ ] "Edited" label (the edited text itself migrates)
+- [ ] Group event messages (joined/left/subject changed) — not written yet
+- [x] WhatsApp Business to WhatsApp Business (verified 2026-11-02 by running the engine stages)
+- [ ] WhatsApp Business through the wizard, the desktop app and `migrate --business`: not yet run with phones
 - [ ] Legacy (pre-2022) Android schema
-- [x] Desktop GUI (Tauri shell around this engine) — builds, opens and boots the engine on macOS; not yet run with phones
+- [x] Desktop GUI (Tauri shell around this engine): builds and boots on macOS; Android and iPhone steps ran with real phones
+- [ ] The desktop app's Transfer step with real phones
 - [ ] iOS → Android (the model layer is already direction-agnostic)
 
 ## Prior art and thanks

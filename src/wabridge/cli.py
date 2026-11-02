@@ -47,6 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--no-media", action="store_true", help="migrate text only")
     m.add_argument("--contacts", help="contacts .vcf export for name resolution")
     m.add_argument("--system", action="store_true", help="pass --system to the iOS restore")
+    m.add_argument("--business", action="store_true", help="WhatsApp Business")
 
     a = sub.add_parser("android", help="Android-side steps").add_subparsers(dest="sub", required=True)
     ap = a.add_parser("pull", help="pull WhatsApp databases (and media) over ADB")
@@ -77,6 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_work(ir)
     ir.add_argument("--udid")
     ir.add_argument("--system", action="store_true")
+    ip = i.add_parser("probe", help="read-only report on a backup's WhatsApp data; contains no message text")
+    ip.add_argument("backup", help="backup folder (the one holding Manifest.db)")
     rb = i.add_parser("rollback", help="restore the untouched pre-migration backup")
     _add_work(rb)
     rb.add_argument("--udid")
@@ -93,6 +96,9 @@ def build_parser() -> argparse.ArgumentParser:
     j = sub.add_parser("inject", help="put ChatStorage.sqlite + media into the backup")
     _add_work(j)
     j.add_argument("--backup")
+
+    v = sub.add_parser("verify", help="prove the modified backup changed nothing outside the target app")
+    _add_work(v)
     return p
 
 
@@ -140,6 +146,11 @@ def main(argv: list[str] | None = None) -> int:
             from . import serve
 
             return serve.main(getattr(args, "work", DEFAULT_WORK))
+        if args.cmd == "ios" and args.sub == "probe":
+            from .ios import probe
+
+            print(probe.report(args.backup))
+            return 0
         work = pipeline.Work(getattr(args, "work", DEFAULT_WORK))
         if args.cmd == "wizard":
             from . import wizard
@@ -158,7 +169,8 @@ def main(argv: list[str] | None = None) -> int:
                 log_fh.close()
         if args.cmd == "migrate":
             pipeline.migrate(work, key=args.key, serial=args.serial, udid=args.udid,
-                             include_media=not args.no_media, contacts_vcf=args.contacts, system=args.system)
+                             include_media=not args.no_media, contacts_vcf=args.contacts, system=args.system,
+                             business=args.business)
         elif args.cmd == "android":
             if args.sub == "pull":
                 pipeline.android_pull(work, serial=args.serial, include_media=not args.no_media,
@@ -193,6 +205,8 @@ def main(argv: list[str] | None = None) -> int:
                              skip_archived=args.skip_archived)
         elif args.cmd == "inject":
             pipeline.inject(work, backup_folder=args.backup)
+        elif args.cmd == "verify":
+            pipeline.verify(work)
         return 0
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)

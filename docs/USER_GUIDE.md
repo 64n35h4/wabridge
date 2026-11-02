@@ -37,8 +37,10 @@ Settings → About phone → tap **Build number** seven times → back → **Dev
 1. Install WhatsApp from the App Store and register with the **same phone number** you use on Android. (WhatsApp will warn that the number is in use elsewhere; that's expected. The Android phone stops receiving messages once the iPhone is registered, but its history is untouched.)
 2. Send **one message** to anyone so WhatsApp creates its database.
 3. Turn off backup encryption: connect the iPhone to the computer, open **Finder** (macOS) or **iTunes / Apple Devices** (Windows), select the iPhone, and untick **Encrypt local backup**. Enter your backup password when asked. (Or use `wabridge ios disable-encryption --password …`.)
-4. Turn off **Find My iPhone** for the duration: Settings → your name → Find My → Find My iPhone → off (Apple ID password). Apple refuses to restore any backup while it is on. Turn it back on afterwards. If the switch is greyed out: Settings → Screen Time → Content & Privacy Restrictions → Location Services → *Allow changes*.
+4. Turn off **Stolen Device Protection** (Settings → Face ID & Passcode) if it's on, because it blocks the next step. Then turn off **Find My iPhone** for the duration: Settings → your name → Find My → Find My iPhone → off (Apple ID password). Apple refuses to restore any backup while it is on. Turn it back on afterwards. If the switch is greyed out: Settings → Screen Time → Content & Privacy Restrictions → Location Services → *Allow changes*.
 5. Unlock the iPhone and tap **Trust** when the computer asks.
+
+**Before restoring:** a restore can send the iPhone through the setup assistant and reset settings, home screen layout, app groupings and timezone, and apps may redownload after you sign in to iCloud. This happened in one test. Back up anything you can't lose, and expect to set the phone up again. Anything that arrives on the iPhone after WaBridge's backup can be lost.
 
 ## Part 3 — Run WaBridge
 

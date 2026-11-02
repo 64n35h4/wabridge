@@ -206,6 +206,8 @@ export function spawnMockEngine(h: Handlers, params = new URLSearchParams(window
           serial: phone.serial,
           model: phone.model,
           root: "/sdcard/Android/media/com.whatsapp/WhatsApp",
+          products: w.flags.has("android-both-apps") ? ["business", "whatsapp"] : ["whatsapp"],
+          business: args.business === true,
           has_crypt15: !w.flags.has("android-no-backup"),
           media_bytes: 3.2 * GB,
         };

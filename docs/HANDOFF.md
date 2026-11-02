@@ -266,9 +266,10 @@ run — fixed, untested).
 | crypt15 decrypt, Android parse, contacts export | verified on device |
 | iPhone backup, inject, restore | verified on device |
 | Text + group chats visible in WhatsApp iOS | **verified on device** |
-| Media files openable on iPhone | **not working**; likely fix in code, untested |
-| Quotes/replies, reactions, edits, group events | not implemented / skipped |
-| WhatsApp Business | wired (domain + Android root), untested |
+| Media files openable on iPhone | **verified on device, 2 Nov** |
+| Quotes/replies, reactions, stickers | **verified on device, 2 Nov** |
+| Edits label, group events | not implemented / skipped |
+| WhatsApp Business | **verified on device, 2 Nov**, via the pipeline stages; CLI, wizard and app paths unrun |
 | Legacy (pre-2022) Android schema | unsupported, raises a clear error |
 | Terminal wizard | verified on device end to end |
 | Engine `serve` protocol | 33 offline tests green |
@@ -318,16 +319,10 @@ before investigating 2–4.
    "stopping" line, seen when the owner quit after the backup on day 3), so a quit mid-restore would
    cut the restore off. A Tauri `CloseRequested` handler that asks while an action runs is the fix;
    `wadecrypt_fallback` passes the key on the command line; the Windows-only `usbmuxd` story.
-3. **Quoted replies**: Android `message_quoted.key_id` is already parsed into
-   `Message.quoted_key_id`. On iOS set `ZWAMESSAGE.ZPARENTMESSAGE` to the Z_PK of the message with
-   that `ZSTANZAID` (two-pass write: insert all, then update parents). Verify whether the quote
-   bubble also needs `ZWAMESSAGEDATAITEM` rows; the pristine DB had none for text quotes.
-4. **Reactions**: Android `message_add_on` + `message_add_on_reaction`. iOS has no reactions
-   table; they are almost certainly encoded in `ZWAMESSAGEINFO` (a `WAMessageReceiptInfo`-style
-   protobuf). Needs a protobuf reverse-engineering pass — take a real reacted message from a
-   fresh backup and decode the blob. Medium-hard.
-5. **Edited messages**: Android `message_edit_info` / `message_future.version`; iOS likely marks
-   edits in the same info blob. Same approach as reactions.
+3. **Quoted replies**: done Nov 2026 in `ZMETADATA`, not `ZPARENTMESSAGE` (1 row in 113,763). Confirmed on a device.
+4. **Reactions**: done Nov 2026 in `ZRECEIPTINFO` field 7. Confirmed on a device.
+5. **Edited messages**: the final text is already on the Android row, so only the "Edited" label is
+   missing. Its iOS storage isn't identified.
 6. **Group events**: Android `message_system*` tables → iOS `ZMESSAGETYPE 6` +
    `ZGROUPEVENTTYPE`. Map at least join/leave/subject-change (2, 3, 1 in older docs; verify).
    Currently skipped by default (`--include-system` / the GUI checkbox writes them as type 0
@@ -349,6 +344,23 @@ before investigating 2–4.
     metadata — research needed).
 12. **Windows**: `start.bat`, `build-sidecar.ps1`, and the whole iPhone path (needs Apple Mobile
     Device Support / iTunes for usbmuxd) are unrun.
+
+## 7b. November 2026: real-device evidence
+
+I ran Pixel 8 Pro (Android 17) → iPhone 18 Pro Max (iOS 27.0.1) with a Business account, and read a
+full backup. Sections 4 and 6 above record what was believed in September; where they differ, trust
+`CLAUDE.md` and `chatstorage.py`'s docstring. Corrections: `ZMEDIALOCALPATH` prefix (the media bug), MIME is in
+`ZVCARDSTRING`, `ZLASTSESSION` is only on the last message, `ZGROUPEVENTTYPE` is 2 on ordinary messages,
+`ZSENTDATE` is nearly always NULL, and iOS writes both directory modes.
+
+I then migrated Business to Business on iOS 27.2, 2 Nov. In order:
+- A one-file restore test reset system data (see `CLAUDE.md` rule 3). Do not call a restore harmless.
+- A rehearsal against the real logged-in Business database found what synthetic targets hid: 372 people twice across 47
+  groups, because WhatsApp syncs groups and members by LID at login; Android's `lid_me` placeholder written as a member;
+  phone JIDs in @lid sessions; and the wrong JID on revoked rows. All fixed from measured rows.
+- The first restore failed in 13 seconds: the scoped package lacked the domain root row. The fix is in
+  `_build_scoped_backup`. The second took about a minute and worked: I confirmed media, reactions, stickers
+  and replies in the app.
 
 ## 8. Working conventions
 

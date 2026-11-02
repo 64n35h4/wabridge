@@ -243,7 +243,7 @@ def backup(backup_dir: str, udid: str | None = None, progress: Progress | None =
 
 
 def restore(backup_dir: str, udid: str | None = None, *, system: bool = False, reboot: bool = True,
-            progress: Progress | None = None) -> None:
+            skip_apps: bool = False, progress: Progress | None = None) -> None:
     """Restore backup_dir (the folder that contains <UDID>/) to the phone.
 
     `system=True` maps to `--system`; some iOS versions only restore app-group data with it
@@ -261,6 +261,7 @@ def restore(backup_dir: str, udid: str | None = None, *, system: bool = False, r
             await _aw(svc.restore(
                 backup_directory=backup_dir, system=system, reboot=reboot, copy=False,
                 settings=True, remove=False, password="", source=lockdown.udid, progress_callback=cb,
+                skip_apps=skip_apps,
             ))
         finally:
             if svc is not None:

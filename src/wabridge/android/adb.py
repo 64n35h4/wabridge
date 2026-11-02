@@ -23,18 +23,14 @@ WA_MEDIA_ROOT_ALTS = (
     "/sdcard/WhatsApp",                       # very old installs (pre-2021)
 )
 WA_BUSINESS_MEDIA_ROOT = "/sdcard/Android/media/com.whatsapp.w4b/WhatsApp Business"
+WA_BUSINESS_MEDIA_ROOT_ALTS = (
+    "/storage/emulated/0/Android/media/com.whatsapp.w4b/WhatsApp Business",
+    "/sdcard/WhatsApp Business",              # very old installs (pre-2021)
+)
 
-# Sub-folders of WhatsApp/Media we migrate. Order = priority when disk space is limited.
-MEDIA_DIRS = [
-    "WhatsApp Images",
-    "WhatsApp Video",
-    "WhatsApp Voice Notes",
-    "WhatsApp Audio",
-    "WhatsApp Documents",
-    "WhatsApp Animated Gifs",
-    "WhatsApp Stickers",
-    "WhatsApp Video Notes",
-]
+# Sub-folders of <root>/Media I migrate, by kind. Order = priority when disk space is limited.
+# Business uses "WhatsApp Business Images" and so on; regular WhatsApp "WhatsApp Images".
+MEDIA_KINDS = ["Images", "Video", "Voice Notes", "Audio", "Documents", "Animated Gifs", "Stickers", "Video Notes"]
 
 
 class AdbError(Exception):
@@ -129,16 +125,41 @@ def shell(cmd: str, serial: str | None = None, check: bool = True) -> str:
     return run(["shell", cmd], serial=serial, check=check)
 
 
-def detect_wa_root(serial: str | None = None, business: bool = False) -> str:
-    roots = [WA_BUSINESS_MEDIA_ROOT] if business else [WA_MEDIA_ROOT, *WA_MEDIA_ROOT_ALTS]
+def _find_root(roots: tuple[str, ...], serial: str | None) -> str | None:
     for root in roots:
         out = shell(f'ls "{root}/Databases" 2>/dev/null', serial=serial, check=False)
         if "msgstore" in out:
             return root
+    return None
+
+
+def detect_wa_root(serial: str | None = None, business: bool = False) -> str:
+    roots = (WA_BUSINESS_MEDIA_ROOT, *WA_BUSINESS_MEDIA_ROOT_ALTS) if business else (WA_MEDIA_ROOT, *WA_MEDIA_ROOT_ALTS)
+    root = _find_root(roots, serial)
+    if root:
+        return root
+    app = "WhatsApp Business" if business else "WhatsApp"
     raise AdbError(
-        "Could not find WhatsApp/Databases on the phone. Open WhatsApp > Settings > Chats > "
+        f"Could not find {app}'s Databases folder on the phone. Open {app} > Settings > Chats > "
         "Chat backup and tap BACK UP, then retry."
     )
+
+
+def detect_products(serial: str | None = None) -> dict[str, str]:
+    """Which WhatsApp apps have a backup on this phone: {"whatsapp": root, "business": root}."""
+    found = {"whatsapp": _find_root((WA_MEDIA_ROOT, *WA_MEDIA_ROOT_ALTS), serial),
+             "business": _find_root((WA_BUSINESS_MEDIA_ROOT, *WA_BUSINESS_MEDIA_ROOT_ALTS), serial)}
+    return {k: v for k, v in found.items() if v}
+
+
+def media_dirs(root: str, serial: str | None = None) -> list[str]:
+    """The media folders actually present, read from the phone rather than assumed from the app."""
+    listing = shell(f'ls -1 "{root}/Media" 2>/dev/null', serial=serial, check=False)
+    present = {line.strip() for line in listing.splitlines()}
+    out = []
+    for kind in MEDIA_KINDS:
+        out += [d for d in (f"WhatsApp {kind}", f"WhatsApp Business {kind}") if d in present]
+    return out
 
 
 def list_backups(root: str, serial: str | None = None) -> list[str]:
@@ -225,12 +246,8 @@ def pull_media(dest: str, root: str, *, serial: str | None = None,
         t.start()
     pulled = []
     try:
-        for d in MEDIA_DIRS:
-            remote = f"{root}/Media/{d}"
-            exists = shell(f'[ -d "{remote}" ] && echo yes', serial=serial, check=False).strip()
-            if exists != "yes":
-                continue
-            pull(remote, media_local, serial, progress)
+        for d in media_dirs(root, serial):
+            pull(f"{root}/Media/{d}", media_local, serial, progress)
             pulled.append(d)
     finally:
         stop.set()

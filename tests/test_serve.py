@@ -72,6 +72,7 @@ class ServeTests(unittest.TestCase):
         self.patches = [
             mock.patch.object(adb, "find_adb", return_value="/fake/adb"),
             mock.patch.object(adb, "devices", self.phones.devices),
+            mock.patch.object(adb, "detect_products", return_value=self.phones.products),
             mock.patch.object(adb, "detect_wa_root", return_value="/sdcard/Android/media/com.whatsapp/WhatsApp"),
             mock.patch.object(adb, "has_crypt15", return_value=True),
             mock.patch.object(adb, "pull_databases", self.phones.pull_databases),
