@@ -45,6 +45,10 @@ WaBridge sends only the files it changed, for the one app it targets, and refuse
 
 Before restoring: back up anything you can't lose, and expect to set the phone up again. Messages that arrive on the iPhone between the backup and the restore can be lost.
 
+### New messages not showing after a migration?
+
+Versions before this fix numbered message order across the whole database, so messages sent or received after the restore were filed in the middle of old chats. Fixed; [what happened and how to repair an already-migrated phone](docs/MESSAGE_ORDER.md) without starting over.
+
 ## Requirements
 
 * Python 3.10+

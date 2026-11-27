@@ -369,8 +369,7 @@ class Writer:
         self.thumb_dir = thumb_dir
         for chat in archive.chats:
             self._import_chat(chat, archive, rep, media_root, include_media)
-        if rep.messages_written:
-            self.renumber_sort()
+        self.renumber_sort()   # always: a re-run over an already-imported phone writes 0 messages but still needs the repair
         self.commit()
         return rep
 
@@ -462,12 +461,23 @@ class Writer:
             self.update("ZWACHATSESSION", spk, values)
 
     def renumber_sort(self) -> None:
-        """Re-assign ZSORT in chronological order across the whole table, so imported history
-        interleaves correctly with messages that already existed on the iPhone."""
-        rows = self.conn.execute("SELECT Z_PK FROM ZWAMESSAGE ORDER BY ZMESSAGEDATE, Z_PK").fetchall()
-        self.conn.executemany("UPDATE ZWAMESSAGE SET ZSORT=? WHERE Z_PK=?",
-                              [(i, r[0]) for i, r in enumerate(rows, 1)])
-        self._sort = len(rows)
+        """Re-assign ZSORT 1..n in chronological order WITHIN each chat, and raise the chat's
+        ZMESSAGECOUNTER to at least n.
+
+        WhatsApp for iOS numbers ZSORT per chat and gives each new message ZMESSAGECOUNTER + 1
+        (on an untouched iPhone, every chat has max(ZSORT) <= ZMESSAGECOUNTER). Numbering across
+        the whole table left imported messages far above the counter, so every message sent or
+        received after the restore sorted into the middle of the old history and looked missing.
+        See docs/MESSAGE_ORDER.md."""
+        sessions = self.conn.execute("SELECT Z_PK, ZMESSAGECOUNTER FROM ZWACHATSESSION").fetchall()
+        for spk, counter in sessions:
+            rows = self.conn.execute("SELECT Z_PK FROM ZWAMESSAGE WHERE ZCHATSESSION=? ORDER BY ZMESSAGEDATE, Z_PK",
+                                     (spk,)).fetchall()
+            self.conn.executemany("UPDATE ZWAMESSAGE SET ZSORT=? WHERE Z_PK=?",
+                                  [(i, r[0]) for i, r in enumerate(rows, 1)])
+            if rows and (counter or 0) < len(rows):
+                self.conn.execute("UPDATE ZWACHATSESSION SET ZMESSAGECOUNTER=? WHERE Z_PK=?", (len(rows), spk))
+        self._sort = self.conn.execute("SELECT COALESCE(MAX(ZSORT), 0) FROM ZWAMESSAGE").fetchone()[0]
 
     def _member(self, spk: int, members: dict[str, int], jid: str, name: str | None, admin: bool, active: bool,
                 archive: Archive) -> int:

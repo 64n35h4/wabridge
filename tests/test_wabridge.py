@@ -163,9 +163,12 @@ class ChatStorageWriterTests(unittest.TestCase):
         self.assertEqual(pk["WAGroupMember"], conn.execute("SELECT COUNT(*) FROM ZWAGROUPMEMBER").fetchone()[0])
         ents = {r[0] for r in conn.execute("SELECT DISTINCT Z_ENT FROM ZWAMESSAGE")}
         self.assertEqual(ents, {7})
-        # ZSORT strictly increasing, no duplicates
-        sorts = [r[0] for r in conn.execute("SELECT ZSORT FROM ZWAMESSAGE ORDER BY Z_PK")]
-        self.assertEqual(len(sorts), len(set(sorts)))
+        # ZSORT is 1..n per chat (as WhatsApp writes it) and never above the chat's ZMESSAGECOUNTER
+        for spk, n, lo, hi, counter in conn.execute(
+                "SELECT s.Z_PK, COUNT(*), MIN(m.ZSORT), MAX(m.ZSORT), s.ZMESSAGECOUNTER FROM ZWACHATSESSION s "
+                "JOIN ZWAMESSAGE m ON m.ZCHATSESSION=s.Z_PK GROUP BY s.Z_PK").fetchall():
+            self.assertEqual((lo, hi), (1, n))
+            self.assertGreaterEqual(counter, hi)
         # group session
         g = conn.execute("SELECT * FROM ZWACHATSESSION WHERE ZCONTACTJID=?", (fixtures.GROUP,)).fetchone()
         self.assertEqual(g["ZSESSIONTYPE"], 1)
@@ -238,10 +241,13 @@ class ChatStorageWriterTests(unittest.TestCase):
         w.finalize()
         conn = sqlite3.connect(self.cs)
         self.assertEqual(conn.execute("SELECT ZLASTMESSAGE FROM ZWACHATSESSION WHERE Z_PK=1").fetchone()[0], 1)
-        rows = conn.execute("SELECT ZMESSAGEDATE FROM ZWAMESSAGE ORDER BY ZSORT").fetchall()
-        dates = [r[0] for r in rows]
-        self.assertEqual(dates, sorted(dates))                       # ZSORT follows chronology
-        self.assertEqual(conn.execute("SELECT MAX(ZSORT), COUNT(*) FROM ZWAMESSAGE").fetchone(), (11, 11))
+        # ZSORT follows chronology within each chat, and the newest message (K101) sorts last
+        for (spk,) in conn.execute("SELECT DISTINCT ZCHATSESSION FROM ZWAMESSAGE").fetchall():
+            dates = [r[0] for r in conn.execute(
+                "SELECT ZMESSAGEDATE FROM ZWAMESSAGE WHERE ZCHATSESSION=? ORDER BY ZSORT", (spk,))]
+            self.assertEqual(dates, sorted(dates))
+        self.assertEqual(conn.execute(
+            "SELECT Z_PK FROM ZWAMESSAGE WHERE ZCHATSESSION=1 ORDER BY ZSORT DESC LIMIT 1").fetchone()[0], 1)
         conn.close()
 
     def test_media_filenames_do_not_collide(self):
